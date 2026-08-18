@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GameWall Mapper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <nav class="view-menu" aria-label="Workspace views">
+    <button id="menuMap" class="menu-item active" type="button">Map</button>
+    <button id="menuCharacters" class="menu-item" type="button">Characters</button>
+  </nav>
+
+  <header class="app-header">
+    <div>
+      <p class="eyebrow">Twinkly Squares Planner</p>
+      <h1>GameWall Control + Tile Mapper <span id="headerSize">7x5</span></h1>
+      <p class="sub">Map <span id="headerTileCount">35</span> tiles in a <span id="headerSizeSub">7x5</span> wall and assign tile locations per master.</p>
+    </div>
+    <div class="header-actions">
+      <button id="btnReset" class="danger">Reset</button>
+    </div>
+  </header>
+
+  <main id="mapView" class="layout view active-view">
+    <section class="panel left-panel">
+      <h2>Map</h2>
+
+      <svg id="gridSvg" viewBox="0 0 980 720" role="img" aria-label="Tile mapper"></svg>
+
+      <p class="hint">
+        Click tiles to inspect and rotate. Use Hardware Wizard to map physical tile locations.
+      </p>
+    </section>
+
+    <section class="panel right-panel">
+      <h2>Project</h2>
+      <div class="meta-grid">
+        <label>Rows
+          <input id="rowsInput" type="number" min="1" max="20" value="5" />
+        </label>
+        <label>Columns
+          <input id="colsInput" type="number" min="1" max="20" value="7" />
+        </label>
+        <label>Expected Masters
+          <input id="mastersInput" type="number" min="1" max="10" value="3" />
+        </label>
+      </div>
+      <button id="btnResize">Apply Grid Size</button>
+
+      <h3>Validation</h3>
+      <ul id="validationList" class="validation-list"></ul>
+
+      <h3>Selected Tile</h3>
+      <div id="tileDetails" class="tile-details">No tile selected.</div>
+      <div id="masterIpRow" class="master-ip-row" hidden>
+        <label>Master IP Address
+          <input id="masterIpInput" type="text" placeholder="192.168.1.x" spellcheck="false" />
+        </label>
+      </div>
+
+      <h3>Hardware Wizard</h3>
+      <div class="discovery-panel">
+        <div class="wizard-panel">
+          <h4>Hardware Wizard</h4>
+          <div class="wizard-grid">
+            <button id="btnWizardDiscover" class="secondary" type="button">Discover Masters</button>
+            <label>Discovered Master
+              <select id="wizardDeviceSelect"></select>
+            </label>
+            <label>Tile Count Override (selected master)
+              <input id="wizardTileCountOverride" type="number" min="1" max="15" placeholder="Auto" />
+            </label>
+          </div>
+          <div class="wizard-start-row">
+            <button id="btnWizardStartDevice" class="secondary" type="button">Start Mapping Selected</button>
+          </div>
+          <div class="wizard-group-row">
+            <span id="wizardGroupBadge" class="wizard-group-badge" aria-live="polite">Group: n/a</span>
+          </div>
+          <div class="wizard-group-row">
+            <button id="btnWizardGroupPrev" class="secondary" type="button">Group Prev</button>
+            <button id="btnWizardGroupSelect" class="secondary" type="button">Select Group</button>
+            <button id="btnWizardGroupNext" class="secondary" type="button">Group Next</button>
+          </div>
+          <div class="wizard-group-row">
+            <button id="btnWizardRotateLeft" class="secondary" type="button">Rotate Left</button>
+            <button id="btnWizardConfirmTile" type="button">Confirm Orientation</button>
+            <button id="btnWizardRotateRight" class="secondary" type="button">Rotate Right</button>
+          </div>
+          <div class="wizard-actions">
+            <button id="btnWizardSkipSegment" class="secondary" type="button">Skip Segment</button>
+            <button id="btnWizardUnlockTile" class="secondary" type="button">Unlock Selected Tile</button>
+            <button id="btnWizardUnlockAll" class="secondary" type="button">Unlock All</button>
+            <button id="btnWizardReplay" class="secondary" type="button">Replay Green Audit</button>
+            <button id="btnWizardNextDevice" class="secondary" type="button">Next Master</button>
+            <button id="btnWizardCancel" class="danger" type="button">Cancel Wizard</button>
+          </div>
+          <div id="wizardStatus" class="hint">Wizard idle. Discover masters to begin.</div>
+          <div class="wizard-progress-wrap">
+            <table id="wizardProgressTable" class="wizard-progress-table" aria-label="Wizard mapping progress">
+              <thead>
+                <tr>
+                  <th>Device</th>
+                  <th>Segment</th>
+                  <th>Role</th>
+                  <th>Tile</th>
+                  <th>Rotation</th>
+                </tr>
+              </thead>
+              <tbody id="wizardProgressBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <h3>Retro Demo</h3>
+      <div class="meta-grid demo-grid">
+        <label>Demo
+          <select id="demoPreset">
+            <option value="mario">Super Mario (NES-style 256x240)</option>
+            <option value="sonic_sms">Sonic (Master System-style 248x192)</option>
+            <option value="sonic_md">Sonic (Mega Drive-style 320x224)</option>
+            <option value="mario_anim">Animated: Mario Character Sprite</option>
+            <option value="sonic_sms_anim">Animated: Sonic Master System Sprite</option>
+            <option value="sonic_md_anim">Animated: Sonic Mega Drive Sprite</option>
+          </select>
+        </label>
+        <label class="import-btn">Load Real Screenshot
+          <input id="demoImageFile" type="file" accept="image/png,image/jpeg,image/webp" />
+        </label>
+      </div>
+      <div id="demoInfo" class="tile-details">No demo loaded.</div>
+      <p class="hint">Drag on the tile map to move the static frame behind the 8x8 tile pixels.</p>
+
+      <h3>Data</h3>
+      <div class="data-actions">
+        <button id="btnExport">Export JSON</button>
+        <label class="import-btn">
+          Import JSON
+          <input id="importFile" type="file" accept="application/json" />
+        </label>
+      </div>
+      <details class="export-preview-wrap" open>
+        <summary>Live Export Schema Preview</summary>
+        <pre id="exportPreview" class="export-preview">Preview will appear here...</pre>
+      </details>
+      <textarea id="jsonOutput" spellcheck="false" placeholder="Exported mapping appears here..."></textarea>
+    </section>
+  </main>
+
+  <main id="charactersView" class="view characters-view" hidden>
+    <section class="panel characters-top">
+      <h2>Characters</h2>
+      <p class="hint">Search Spriters Resource, download a sheet, auto-detect sprites, then build actions by dragging frames into a timeline.</p>
+      <div class="character-search-row">
+        <input id="charSearchInput" type="text" placeholder="Search character (e.g. sonic, mario, tails)" />
+        <button id="btnCharSearch" type="button">Search Spriters Resource</button>
+      </div>
+      <div class="character-search-row">
+        <label class="import-btn">Load Sheet File
+          <input id="charSheetFile" type="file" accept="image/png,image/webp,image/jpeg" />
+        </label>
+        <label>Character File Name
+          <input id="characterFileName" type="text" value="character-run" placeholder="character-run" />
+        </label>
+      </div>
+      <div class="data-actions">
+        <button id="btnSaveCharacterJson" type="button">Save Character JSON</button>
+        <label class="import-btn">
+          Load Character JSON
+          <input id="loadCharacterJson" type="file" accept="application/json" />
+        </label>
+      </div>
+      <div id="charSearchStatus" class="hint">No search yet.</div>
+      <div id="charSearchResults" class="search-results"></div>
+    </section>
+
+    <section class="panel characters-grid">
+      <div class="characters-col">
+        <h3>Detected Sprites</h3>
+        <div class="detect-controls">
+          <label>Detection Strictness
+            <input id="detectStrictness" type="range" min="0" max="1" step="0.05" value="0.65" />
+          </label>
+          <div id="detectStrictnessValue" class="hint">0.65</div>
+          <div class="data-actions">
+            <button id="btnDetectNow" type="button">Detect Now</button>
+            <button id="btnDetectSweep" class="secondary" type="button">Try 20 Strictness</button>
+          </div>
+          <div id="detectSummary" class="hint">Load a sheet, then tune strictness.</div>
+        </div>
+        <div id="spriteSheetMeta" class="tile-details">No sheet loaded.</div>
+        <div id="spritePalette" class="sprite-palette"></div>
+      </div>
+
+      <div class="characters-col">
+        <h3>Actions</h3>
+        <div class="action-head">
+          <input id="actionNameInput" type="text" placeholder="Action name (run, jump, idle...)" />
+          <button id="btnCreateAction" type="button">Create/Select</button>
+        </div>
+        <label>Action
+          <select id="actionSelect"></select>
+        </label>
+        <div id="timelineDrop" class="timeline-drop" title="Drag sprites here to add frames">
+          Drag sprites here to add frames to this action
+        </div>
+        <div id="actionTimeline" class="action-timeline"></div>
+      </div>
+
+      <div class="characters-col">
+        <h3>Preview</h3>
+        <canvas id="charPreviewCanvas" width="320" height="220" aria-label="Character animation preview"></canvas>
+        <div id="previewInfo" class="tile-details">No action selected.</div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <p>Status: <span id="statusText">Ready.</span></p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
