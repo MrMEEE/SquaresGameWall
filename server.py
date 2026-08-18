@@ -10,14 +10,25 @@ Usage:
 """
 import sys
 import json
+from datetime import datetime, timezone
 import urllib.request
 import urllib.error
 import urllib.parse
+from pathlib import Path
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+
+
+CLIENT_LOG_FILE = Path("/tmp/gamewall-clientlog.txt")
 
 
 class GameWallHandler(SimpleHTTPRequestHandler):
     log_message = lambda self, *a: None  # quiet
+
+    def end_headers(self):
+        # Prevent stale HTML/JS/CSS from persisting during rapid iteration.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        super().end_headers()
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -36,6 +47,10 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else None
             self._handle_proxy("POST", parsed.query, body=body)
+        elif parsed.path == "/clientlog":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            self._handle_clientlog(body)
         else:
             self.send_error(405)
 
@@ -47,7 +62,7 @@ class GameWallHandler(SimpleHTTPRequestHandler):
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Auth-Token, X-GameWall-Build")
 
     def _handle_scan(self, query_string):
         """Scan an entire subnet for Twinkly devices using Python threads."""
@@ -115,6 +130,40 @@ class GameWallHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_clientlog(self, body):
+        try:
+            payload = json.loads(body.decode("utf-8") if body else "{}")
+        except Exception:
+            payload = {"message": "invalid json payload", "raw": str(body[:200])}
+
+        level = str(payload.get("level", "info")).upper()
+        source = str(payload.get("source", "client"))
+        message = str(payload.get("message", ""))
+        details = payload.get("details", None)
+        build = str(payload.get("build", "unknown"))
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+        line = f"[{stamp}] [{level}] [{source}] [build:{build}] {message}"
+        if details is not None:
+            try:
+                line += " " + json.dumps(details, separators=(",", ":"), ensure_ascii=True)
+            except Exception:
+                line += f" {details}"
+        print(line, flush=True)
+        try:
+            with CLIENT_LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception:
+            pass
+
+        out = b'{"ok":true}'
+        self.send_response(200)
+        self._cors_headers()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
     def _handle_proxy(self, method, query_string, body):
         params = urllib.parse.parse_qs(query_string)
         target = params.get("url", [None])[0]
@@ -132,6 +181,18 @@ class GameWallHandler(SimpleHTTPRequestHandler):
         ):
             self.send_error(403, "Only local addresses allowed")
             return
+
+        parsed_target = urllib.parse.urlparse(target)
+        target_path = parsed_target.path or ""
+        requires_build = target_path in ("/xled/v1/led/mode", "/xled/v1/led/rt/frame")
+        if requires_build:
+            build = self.headers.get("X-GameWall-Build", "")
+            if not build:
+                stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+                print(
+                    f"[{stamp}] [WARN] [proxy] missing X-GameWall-Build for {target_path}; allowing request",
+                    flush=True,
+                )
 
         headers = {
             "Content-Type": self.headers.get("Content-Type", "application/json"),
@@ -180,6 +241,7 @@ if __name__ == "__main__":
     print(f"GameWall server running at http://localhost:{port}/")
     print("  Static files served from current directory.")
     print("  Twinkly proxy available at /proxy?url=http://DEVICE_IP/...")
+    print(f"  Client telemetry log file: {CLIENT_LOG_FILE}")
     print("  Press Ctrl+C to stop.")
     try:
         server.serve_forever()

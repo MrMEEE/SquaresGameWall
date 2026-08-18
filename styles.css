@@ -237,6 +237,28 @@ button:disabled {
   margin-bottom: 8px;
 }
 
+.profile-grid {
+  grid-template-columns: 1.2fr 1fr;
+  margin-bottom: 8px;
+}
+
+.profile-actions {
+  flex-wrap: wrap;
+}
+
+.profile-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.profile-toggle input {
+  width: 16px;
+  height: 16px;
+}
+
 .export-preview-wrap {
   border: 1px solid var(--line);
   border-radius: 10px;

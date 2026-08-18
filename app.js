@@ -1,4 +1,5 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
+const APP_BUILD = "20260818-rtfix3";
 const MAX_TILES_PER_MASTER = 15;
 const TILE_PIXEL_GRID = 8;
 const LEDS_PER_TILE = TILE_PIXEL_GRID * TILE_PIXEL_GRID;
@@ -75,8 +76,12 @@ const state = {
   tiles: [],
   masterIPs: {},
   masterLeds: {},
+  masterLedProbed: {},
   tileRotations: {},
   twinklyTokens: {},
+  twinklyRtMode: {},
+  twinklyRtModeAt: {},
+  twinklyRtFrameFormat: {},
   livePushActive: false,
   livePushRafId: null,
   discoveredDevices: [],
@@ -150,6 +155,19 @@ const state = {
     autosaveTimer: null,
     autosaveStorageKey: "gamewall.characters.autosave.v1",
   },
+  mapProfiles: {
+    profiles: [],
+    activeProfileId: "",
+    defaultProfileId: "",
+  },
+  mirrorStats: {
+    okCount: 0,
+    errCount: 0,
+    lastOkAt: 0,
+    lastErrAt: 0,
+    lastErrText: "",
+    lastDurationMs: 0,
+  },
   lastExportPreviewJson: "",
 };
 
@@ -186,6 +204,7 @@ const el = {
   btnWizardUnlockAll: document.getElementById("btnWizardUnlockAll"),
   btnWizardReplay: document.getElementById("btnWizardReplay"),
   btnWizardNextDevice: document.getElementById("btnWizardNextDevice"),
+  btnWizardDone: document.getElementById("btnWizardDone"),
   btnWizardCancel: document.getElementById("btnWizardCancel"),
   wizardStatus: document.getElementById("wizardStatus"),
   wizardProgressBody: document.getElementById("wizardProgressBody"),
@@ -201,6 +220,14 @@ const el = {
   btnReset: document.getElementById("btnReset"),
   btnExport: document.getElementById("btnExport"),
   importFile: document.getElementById("importFile"),
+  configProfileSelect: document.getElementById("configProfileSelect"),
+  configProfileName: document.getElementById("configProfileName"),
+  btnSaveProfile: document.getElementById("btnSaveProfile"),
+  btnLoadProfile: document.getElementById("btnLoadProfile"),
+  btnSetDefaultProfile: document.getElementById("btnSetDefaultProfile"),
+  btnRenameProfile: document.getElementById("btnRenameProfile"),
+  btnDeleteProfile: document.getElementById("btnDeleteProfile"),
+  profileSaveOnExit: document.getElementById("profileSaveOnExit"),
   headerSize: document.getElementById("headerSize"),
   headerTileCount: document.getElementById("headerTileCount"),
   headerSizeSub: document.getElementById("headerSizeSub"),
@@ -231,8 +258,24 @@ const el = {
   previewInfo: document.getElementById("previewInfo"),
 };
 
+function getActiveMapProfile() {
+  const id = state.mapProfiles?.activeProfileId || "";
+  if (!id) return null;
+  return (state.mapProfiles.profiles || []).find((p) => p.id === id) || null;
+}
+
 function setStatus(message) {
-  el.statusText.textContent = message;
+  const active = getActiveMapProfile();
+  const suffix = active ? ` [profile: ${active.name}]` : "";
+  el.statusText.textContent = `${message}${suffix}`;
+}
+
+function setPushStatus(message) {
+  if (el.pushStatus) {
+    el.pushStatus.textContent = message;
+    return;
+  }
+  setStatus(message);
 }
 
 function updateHeader() {
@@ -268,6 +311,16 @@ function getTileAt(row, col) {
   return state.tiles.find((t) => t.row === row && t.col === col) || null;
 }
 
+function inferLedGroupForSegment(segment) {
+  const resolved = Number(state.wizard.segmentResolvedGroupIndex?.[segment]);
+  if (Number.isInteger(resolved) && resolved >= 0) return resolved + 1;
+
+  const groups = Array.isArray(state.wizard.segmentLedGroups) ? state.wizard.segmentLedGroups : [];
+  if (segment >= 0 && segment < groups.length) return segment + 1;
+
+  return null;
+}
+
 function buildTileMasterAssignmentMap() {
   const assignments = new Map();
   const masterTileByIp = new Map();
@@ -279,6 +332,7 @@ function buildTileMasterAssignmentMap() {
       masterTileId: tile.id,
       masterIp: ip,
       segment: 0,
+      ledGroup: inferLedGroupForSegment(0),
     });
     if (ip) masterTileByIp.set(ip, tile.id);
   }
@@ -309,6 +363,7 @@ function buildTileMasterAssignmentMap() {
       masterTileId: Number.isInteger(masterTileId) ? masterTileId : null,
       masterIp: ip,
       segment: Number.isInteger(item.segment) ? item.segment : null,
+      ledGroup: Number.isInteger(item.ledGroup) ? item.ledGroup : null,
     });
   }
 
@@ -1137,11 +1192,38 @@ function getAnimatedPixelColorAtWall(wallX, wallY) {
   return `rgba(${frame.data[i]}, ${frame.data[i + 1]}, ${frame.data[i + 2]}, ${a.toFixed(3)})`;
 }
 
-// Returns a flat 64-element array of [r,g,b] triples for the 8x8 tile, with rotation applied.
+function cssColorToRgb(cssColor) {
+  const m = String(cssColor || "").match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (m) {
+    return [Number(m[1]), Number(m[2]), Number(m[3])];
+  }
+  const hex = String(cssColor || "").replace("#", "");
+  const n = parseInt(hex.length === 3
+    ? hex.split("").map((c) => c + c).join("")
+    : hex, 16);
+  if (Number.isFinite(n)) {
+    return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+  }
+  return [16, 18, 21];
+}
+
+function animatedBackgroundColor(baseCssColor, wallX, wallY) {
+  const [r, g, b] = cssColorToRgb(baseCssColor);
+  const phase = (state.animation.frameIndex || 0) + Math.floor((state.animation.frameTimerMs || 0) / 30);
+  const stripe = ((wallX + wallY + phase) % 8) < 4 ? 1 : -1;
+  const delta = stripe * 6;
+  const clamp = (v) => Math.max(0, Math.min(255, v));
+  return `rgb(${clamp(r + delta)}, ${clamp(g + delta)}, ${clamp(b + delta)})`;
+}
+
+// Returns a flat 64-element array of [r,g,b] triples indexed by Twinkly LED index,
+// with tile rotation applied.
 function getTilePixelRgb(tileId) {
   const rot = state.tileRotations[tileId] || 0;
   const grid = TILE_PIXEL_GRID;
-  const pixels = [];
+  const pixels = Array.from({ length: LEDS_PER_TILE }, () => [16, 18, 21]);
+  const tile = getTileById(tileId);
+  if (!tile) return pixels;
 
   for (let y = 0; y < grid; y += 1) {
     for (let x = 0; x < grid; x += 1) {
@@ -1152,26 +1234,34 @@ function getTilePixelRgb(tileId) {
       else if (rot === 180) { sx = grid - 1 - x; sy = grid - 1 - y; }
       else                  { sx = grid - 1 - y; sy = x; }
 
-      const tile = getTileById(tileId);
       const wallX = (tile.col - 1) * grid + sx;
       const wallY = (tile.row - 1) * grid + sy;
       const sourceX = state.demoOffsetX + wallX;
       const sourceY = state.demoOffsetY + wallY;
 
       const animated = getAnimatedPixelColorAtWall(wallX, wallY);
-      const cssColor = animated || getPixelColorAtSource(sourceX, sourceY);
+      const baseColor = getPixelColorAtSource(sourceX, sourceY);
+      const cssColor = animated || (
+        state.animation.active
+          ? animatedBackgroundColor(baseColor, wallX, wallY)
+          : baseColor
+      );
 
       // Parse the css color string to r,g,b
       const m = cssColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      let rgb;
       if (m) {
-        pixels.push([Number(m[1]), Number(m[2]), Number(m[3])]);
+        rgb = [Number(m[1]), Number(m[2]), Number(m[3])];
       } else {
         const hex = cssColor.replace("#", "");
         const n = parseInt(hex.length === 3
           ? hex.split("").map((c) => c + c).join("")
           : hex, 16) || 0x101215;
-        pixels.push([(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]);
+        rgb = [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
       }
+
+      const ledIndex = tileCoordToLedIndex(x, y);
+      pixels[ledIndex] = rgb;
     }
   }
   return pixels;
@@ -1185,11 +1275,30 @@ function getTilePixelRgb(tileId) {
 async function twinklyFetch(ip, path, options = {}) {
   const deviceUrl = `http://${ip}${path}`;
   const proxyUrl = `/proxy?url=${encodeURIComponent(deviceUrl)}`;
-  const fetchOnce = (url) => fetch(url, {
-    method: options.method || "GET",
-    headers: options.headers || {},
-    body: options.body,
-  });
+  const timeoutMs = Number.isFinite(options.timeoutMs) ? Number(options.timeoutMs) : 2500;
+  const baseHeaders = {
+    "X-GameWall-Build": APP_BUILD,
+    ...(options.headers || {}),
+  };
+  const fetchOnce = async (url) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(500, timeoutMs));
+    try {
+      return await fetch(url, {
+        method: options.method || "GET",
+        headers: baseHeaders,
+        body: options.body,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        throw new Error(`request timed out after ${Math.max(500, timeoutMs)}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
   // Proxy-first: if proxy responds (even with error), use that result and do not
   // mask it by falling back to direct browser fetch.
@@ -1257,21 +1366,81 @@ async function twinklyToken(ip) {
   return twinklyLogin(ip);
 }
 
+async function assertTwinklyApiOk(response, path) {
+  if (!response || !response.ok) return;
+  const contentType = String(response.headers?.get("Content-Type") || "").toLowerCase();
+  if (!contentType.includes("application/json")) return;
+
+  let payload = null;
+  try {
+    payload = await response.clone().json();
+  } catch (_e) {
+    return;
+  }
+
+  const code = Number(payload?.code);
+  if (!Number.isFinite(code)) return;
+  if (code === 1000) return;
+
+  const msg = payload?.error || payload?.message || payload?.detail || "unknown error";
+  throw new Error(`twinkly api rejected ${path}: code ${code} (${msg})`);
+}
+
 async function twinklySetRtMode(ip, token) {
-  await twinklyFetch(ip, "/xled/v1/led/mode", {
+  const res = await twinklyFetch(ip, "/xled/v1/led/mode", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Auth-Token": token },
     body: JSON.stringify({ mode: "rt" }),
   });
+  await assertTwinklyApiOk(res, "/xled/v1/led/mode");
 }
 
 async function twinklyPushFrame(ip, token, rgbFrameBytes) {
-  // HTTP RT frame is raw RGB bytes only — no version byte (that's UDP-only).
-  await twinklyFetch(ip, "/xled/v1/led/rt/frame", {
+  const sendPayload = (payload) => twinklyFetch(ip, "/xled/v1/led/rt/frame", {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream", "X-Auth-Token": token },
-    body: rgbFrameBytes,
+    body: payload,
+    timeoutMs: 5000,
   });
+
+  const cachedFormat = state.twinklyRtFrameFormat[ip];
+  if (cachedFormat === "raw") {
+    const res = await sendPayload(rgbFrameBytes);
+    await assertTwinklyApiOk(res, "/xled/v1/led/rt/frame(raw)");
+    return;
+  }
+
+  const prefixed = new Uint8Array(rgbFrameBytes.length + 1);
+  prefixed[0] = 1;
+  prefixed.set(rgbFrameBytes, 1);
+
+  if (cachedFormat === "v1") {
+    const res = await sendPayload(prefixed);
+    await assertTwinklyApiOk(res, "/xled/v1/led/rt/frame(v1)");
+    return;
+  }
+
+  // Unknown format for this device: try version-prefixed first, then raw.
+  let firstErr = null;
+  try {
+    const res = await sendPayload(prefixed);
+    await assertTwinklyApiOk(res, "/xled/v1/led/rt/frame(v1)");
+    state.twinklyRtFrameFormat[ip] = "v1";
+    return;
+  } catch (err) {
+    firstErr = err;
+  }
+
+  try {
+    const res = await sendPayload(rgbFrameBytes);
+    await assertTwinklyApiOk(res, "/xled/v1/led/rt/frame(raw)");
+    state.twinklyRtFrameFormat[ip] = "raw";
+  } catch (err) {
+    state.twinklyRtFrameFormat[ip] = "";
+    const msg1 = firstErr && firstErr.message ? firstErr.message : String(firstErr);
+    const msg2 = err && err.message ? err.message : String(err);
+    throw new Error(`rt frame failed (v1: ${msg1}; raw: ${msg2})`);
+  }
 }
 
 function setWizardStatus(message) {
@@ -1395,6 +1564,7 @@ function updateWizardControlStates() {
   }
 
   if (el.btnWizardNextDevice) el.btnWizardNextDevice.disabled = !hasQueue;
+  if (el.btnWizardDone) el.btnWizardDone.disabled = !active;
   if (el.btnWizardCancel) el.btnWizardCancel.disabled = !active;
   renderWizardGroupBadge();
   updateGeneralButtonStates();
@@ -1403,7 +1573,9 @@ function updateWizardControlStates() {
 function updateGeneralButtonStates() {
   const selectedTile = Number.isInteger(state.selectedTileId) ? getTileById(state.selectedTileId) : null;
   const selectedMasterHasIp = Boolean(selectedTile?.isMaster && state.masterIPs[selectedTile.id]);
-  const mastersWithIp = state.tiles.filter((t) => t.isMaster && state.masterIPs[t.id]).length;
+  const mastersWithIp = Object.keys(state.masterIPs || {})
+    .map((k) => Number(k))
+    .filter((id) => Number.isInteger(id) && Boolean(getTileById(id))).length;
 
   if (el.btnQueryMaster) el.btnQueryMaster.disabled = !selectedMasterHasIp;
   if (el.btnPushHardware) el.btnPushHardware.disabled = mastersWithIp === 0;
@@ -1432,6 +1604,110 @@ function updateGeneralButtonStates() {
   if (el.btnCreateAction) {
     el.btnCreateAction.disabled = !(el.actionNameInput?.value || "").trim();
   }
+
+  if (el.configProfileSelect) {
+    const hasSelectedProfile = Boolean(el.configProfileSelect.value);
+    if (el.btnLoadProfile) el.btnLoadProfile.disabled = !hasSelectedProfile;
+    if (el.btnSetDefaultProfile) el.btnSetDefaultProfile.disabled = !hasSelectedProfile;
+    if (el.btnRenameProfile) el.btnRenameProfile.disabled = !hasSelectedProfile;
+    if (el.btnDeleteProfile) el.btnDeleteProfile.disabled = !hasSelectedProfile;
+    if (el.profileSaveOnExit) el.profileSaveOnExit.disabled = !hasSelectedProfile;
+  }
+}
+
+let autoHardwarePushLastMs = 0;
+let autoHardwarePushInFlight = false;
+let passiveHardwareMirrorTimerId = null;
+let autoMirrorInfoLastText = "";
+let autoMirrorInfoLastAtMs = 0;
+let mirrorDebugLastInfoAtMs = 0;
+let mirrorDebugLastErrorAtMs = 0;
+let mirrorDebugLastErrorText = "";
+
+function setAutoMirrorInfo(text) {
+  const now = Date.now();
+  if (text === autoMirrorInfoLastText && (now - autoMirrorInfoLastAtMs) < 3000) return;
+  autoMirrorInfoLastText = text;
+  autoMirrorInfoLastAtMs = now;
+  setPushStatus(text);
+}
+
+function formatMirrorStatsSuffix() {
+  const s = state.mirrorStats;
+  const okAgo = s.lastOkAt ? `${Math.max(0, Math.round((Date.now() - s.lastOkAt) / 1000))}s` : "never";
+  const err = s.lastErrText ? ` err:${s.lastErrText}` : "";
+  return ` [ok:${s.okCount} last:${okAgo} dt:${Math.round(s.lastDurationMs)}ms${err}]`;
+}
+
+function postClientLog(level, source, message, details = null) {
+  fetch("/clientlog", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ level, source, message, details, build: APP_BUILD }),
+  }).catch(() => {
+    // Ignore logging transport errors.
+  });
+}
+
+function postMirrorInfo(message, details = null, minIntervalMs = 5000) {
+  const now = Date.now();
+  if (now - mirrorDebugLastInfoAtMs < minIntervalMs) return;
+  mirrorDebugLastInfoAtMs = now;
+  postClientLog("info", "mirror", message, details);
+}
+
+function postMirrorError(message, details = null, minIntervalMs = 2500) {
+  const now = Date.now();
+  if (message === mirrorDebugLastErrorText && (now - mirrorDebugLastErrorAtMs) < minIntervalMs) return;
+  mirrorDebugLastErrorText = message;
+  mirrorDebugLastErrorAtMs = now;
+  postClientLog("error", "mirror", message, details);
+}
+
+function maybeAutoSyncHardwareFromVirtualMap() {
+  if (state.wizard.active) return;
+  if (state.livePushActive) return;
+
+  const masters = Object.keys(state.masterIPs || {})
+    .map((k) => Number(k))
+    .filter((id) => Number.isInteger(id) && Boolean(getTileById(id)));
+  if (!masters.length) {
+    setAutoMirrorInfo(`Auto mirror waiting: map at least one master tile and set its IP address.${formatMirrorStatsSuffix()}`);
+    postMirrorInfo("waiting-no-masters", {
+      stats: state.mirrorStats,
+      wizardActive: state.wizard.active,
+      livePushActive: state.livePushActive,
+    }, 8000);
+    return;
+  }
+
+  const now = Date.now();
+  if (autoHardwarePushInFlight || (now - autoHardwarePushLastMs) < 80) return;
+  autoHardwarePushLastMs = now;
+  autoHardwarePushInFlight = true;
+
+  pushAllTilesToHardware({ quiet: true })
+    .catch((err) => {
+      setPushStatus(`Auto mirror failed: ${err.message}${formatMirrorStatsSuffix()}`);
+      postMirrorError("auto-mirror-failed", {
+        error: err.message,
+        stats: state.mirrorStats,
+        animationActive: state.animation.active,
+        masters,
+      });
+    })
+    .finally(() => {
+      autoHardwarePushInFlight = false;
+    });
+}
+
+function ensurePassiveHardwareMirror() {
+  if (passiveHardwareMirrorTimerId != null) return;
+
+  passiveHardwareMirrorTimerId = setInterval(() => {
+    if (state.wizard.active || state.livePushActive) return;
+    maybeAutoSyncHardwareFromVirtualMap();
+  }, 100);
 }
 
 function getWizardOverrideTileCountForIp(ip) {
@@ -1465,7 +1741,7 @@ function inferSegmentsFromLedCount(ip, ledCountRaw) {
   const inferred = raw > 0 ? Math.max(1, Math.round(raw / LEDS_PER_TILE)) : 1;
 
   if (inferred > MAX_TILES_PER_MASTER) {
-    const fallback = 6;
+    const fallback = 15;
     return {
       segments: fallback,
       effectiveLedCount: fallback * LEDS_PER_TILE,
@@ -1501,7 +1777,7 @@ function renderWizardProgressTable() {
   if (!rows.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 5;
+    td.colSpan = 6;
     td.className = "wizard-progress-empty";
     td.textContent = "No mapped segments yet.";
     tr.appendChild(td);
@@ -1515,6 +1791,9 @@ function renderWizardProgressTable() {
     const rotation = Number.isFinite(lock?.rotation)
       ? lock.rotation
       : (state.tileRotations[row.tileId] || 0);
+    const ledGroup = Number.isInteger(row.ledGroup)
+      ? row.ledGroup
+      : (Number.isInteger(lock?.ledGroup) ? lock.ledGroup : null);
 
     const cells = [
       row.ip,
@@ -1522,6 +1801,7 @@ function renderWizardProgressTable() {
       row.role,
       String(row.tileId),
       `${rotation}°`,
+      ledGroup == null ? "-" : String(ledGroup),
     ];
 
     for (const value of cells) {
@@ -2238,7 +2518,13 @@ async function wizardRotate(delta) {
 function recordWizardAssignment(ip, segment, tileId, role) {
   const key = `${ip}|${segment}`;
   const existingIdx = state.wizard.assignments.findIndex((a) => `${a.ip}|${a.segment}` === key);
-  const next = { ip, segment, tileId, role };
+  const next = {
+    ip,
+    segment,
+    tileId,
+    role,
+    ledGroup: inferLedGroupForSegment(segment),
+  };
   if (existingIdx >= 0) state.wizard.assignments[existingIdx] = next;
   else state.wizard.assignments.push(next);
   renderWizardProgressTable();
@@ -2360,6 +2646,7 @@ async function wizardConfirmTile() {
     segment,
     role,
     rotation: state.tileRotations[tile.id] || 0,
+    ledGroup: inferLedGroupForSegment(segment),
   };
   recordWizardAssignment(ip, segment, tile.id, role);
 
@@ -2466,6 +2753,19 @@ function wizardCancel() {
   renderWizardProgressTable();
   saveMapAutosave();
   updateWizardControlStates();
+  maybeAutoSyncHardwareFromVirtualMap();
+}
+
+function wizardDone() {
+  stopWizardRedBlink();
+  state.wizard.active = false;
+  state.wizard.phase = "idle";
+  state.wizard.yellowShown = false;
+  setWizardStatus("Mapping done. Virtual map output now mirrors to tiles.");
+  renderWizardProgressTable();
+  saveMapAutosave();
+  updateWizardControlStates();
+  maybeAutoSyncHardwareFromVirtualMap();
 }
 
 async function refreshWizardMetadataInBackground(ip, nonceAtStart) {
@@ -2583,19 +2883,19 @@ async function wizardStartNextDevice() {
 async function probeSelectedMaster() {
   const tile = getTileById(state.selectedTileId);
   if (!tile || !tile.isMaster) {
-    el.pushStatus.textContent = "Select a master tile first, then query it.";
+    setPushStatus("Select a master tile first, then query it.");
     setStatus("Select a master tile first.");
     return;
   }
 
   const ip = state.masterIPs[tile.id];
   if (!ip) {
-    el.pushStatus.textContent = `Master tile ${tile.id} has no IP assigned.`;
+    setPushStatus(`Master tile ${tile.id} has no IP assigned.`);
     setStatus(`Master tile ${tile.id} has no IP assigned.`);
     return;
   }
 
-  el.pushStatus.textContent = `Querying master tile ${tile.id} (${ip})...`;
+  setPushStatus(`Querying master tile ${tile.id} (${ip})...`);
 
   try {
     const gestaltRes = await twinklyFetch(ip, "/xled/v1/gestalt");
@@ -2643,12 +2943,12 @@ async function probeSelectedMaster() {
       ? `Device tiles≈${estimatedTiles} (from ${ledCount} LEDs), mapped tiles=${mappedTiles.length}.`
       : `Mapped tiles=${mappedTiles.length}. Device did not report LED count.`;
 
-    el.pushStatus.textContent = `Master ${tile.id} (${ip}): ${mismatch} ${topologyHint}`;
+    setPushStatus(`Master ${tile.id} (${ip}): ${mismatch} ${topologyHint}`);
     setStatus(`Queried master ${tile.id}. ${mismatch}`);
     renderTileDetails();
     saveMapAutosave();
   } catch (err) {
-    el.pushStatus.textContent = `Master query failed for ${ip}: ${err.message}`;
+    setPushStatus(`Master query failed for ${ip}: ${err.message}`);
     setStatus(`Master query failed for ${ip}: ${err.message}`);
   }
 }
@@ -2657,56 +2957,246 @@ async function pushMasterToHardware(masterId) {
   const ip = state.masterIPs[masterId];
   if (!ip) return;
 
-  // Query the device's actual LED count if we don't have it cached.
+  const token = await twinklyToken(ip);
+
+  // Query the device's actual LED count once per session per IP.
+  // Some older cached maps hold 64, which causes RT frame rejections (code 1102)
+  // on larger Square chains unless we refresh from gestalt.
   let totalLeds = state.masterLeds[masterId];
-  if (!totalLeds) {
+  const shouldProbeLedCount = !state.masterLedProbed[ip] || !Number.isInteger(totalLeds) || totalLeds < LEDS_PER_TILE;
+  if (shouldProbeLedCount) {
+    const ledCandidates = [];
+
+    const maxMappedGroup = (state.wizard.assignments || [])
+      .filter((a) => a.ip === ip)
+      .reduce((m, a) => {
+        const g = Number(a.ledGroup);
+        return Number.isInteger(g) && g > m ? g : m;
+      }, 0);
+    if (maxMappedGroup > 0) ledCandidates.push(maxMappedGroup * LEDS_PER_TILE);
+
+    const maxMappedSegment = (state.wizard.assignments || [])
+      .filter((a) => a.ip === ip)
+      .reduce((m, a) => {
+        const s = Number(a.segment);
+        return Number.isInteger(s) && s > m ? s : m;
+      }, -1);
+    if (maxMappedSegment >= 0) ledCandidates.push((maxMappedSegment + 1) * LEDS_PER_TILE);
+
     try {
-      const res = await twinklyFetch(ip, "/xled/v1/gestalt");
+      const res = await twinklyFetch(ip, "/xled/v1/gestalt", {
+        headers: { "X-Auth-Token": token },
+      });
       if (res.ok) {
         const info = await res.json();
-        totalLeds = info.number_of_led || 64;
-        state.masterLeds[masterId] = totalLeds;
+        const reported = Number(info.number_of_led || 0);
+        if (Number.isInteger(reported) && reported > 0) {
+          ledCandidates.push(reported);
+        }
       }
     } catch (_e) {
-      totalLeds = 64;
+      // Try unauth gestalt as a fallback on older firmware.
+      try {
+        const res2 = await twinklyFetch(ip, "/xled/v1/gestalt");
+        if (res2.ok) {
+          const info2 = await res2.json();
+          const reported2 = Number(info2.number_of_led || 0);
+          if (Number.isInteger(reported2) && reported2 > 0) {
+            ledCandidates.push(reported2);
+          }
+        }
+      } catch (_e2) {
+        // Keep fallback candidates only.
+      }
     }
+
+    totalLeds = ledCandidates.length
+      ? Math.max(...ledCandidates)
+      : LEDS_PER_TILE;
+    state.masterLeds[masterId] = totalLeds;
+    state.masterLedProbed[ip] = true;
   }
 
   const chain = getOrderedTilesForMaster(masterId);
 
+  // Prefer wizard-assigned LED groups for slot placement. This preserves
+  // non-linear physical ordering discovered during mapping.
+  const tileGroupById = new Map();
+  for (const item of state.wizard.assignments || []) {
+    if (item.ip !== ip) continue;
+    if (!Number.isInteger(item.tileId)) continue;
+    const g = Number(item.ledGroup);
+    if (!Number.isInteger(g) || g < 1) continue;
+    tileGroupById.set(item.tileId, g);
+  }
+  const hasMappedGroups = tileGroupById.size > 0;
+  if (!tileGroupById.has(masterId)) {
+    tileGroupById.set(masterId, 1);
+  }
+
+  const deviceLeds = Number(totalLeds || 0);
+  let requiredLeds = deviceLeds;
+  for (const tileId of chain) {
+    const group = tileGroupById.get(tileId);
+    if (!Number.isInteger(group) || group < 1) continue;
+    const endLed = group * LEDS_PER_TILE;
+    if (endLed > requiredLeds) requiredLeds = endLed;
+  }
+  if (!Number.isFinite(requiredLeds) || requiredLeds < LEDS_PER_TILE) {
+    requiredLeds = LEDS_PER_TILE;
+  }
+  if (Number.isFinite(deviceLeds) && deviceLeds > 0) {
+    requiredLeds = Math.min(requiredLeds, deviceLeds);
+  }
+
   // Allocate a full frame for the device (zeros = black for unprogrammed LEDs).
-  const frameBytes = new Uint8Array(totalLeds * 3);
+  const frameBytes = new Uint8Array(requiredLeds * 3);
 
-  chain.forEach((tileId, tileIdx) => {
-    if (tileIdx >= totalLeds / LEDS_PER_TILE) return; // don't exceed device size
-    const pixels = getTilePixelRgb(tileId);
-    const base = tileIdx * LEDS_PER_TILE * 3;
-    pixels.forEach(([r, g, b], pIdx) => {
-      frameBytes[base + pIdx * 3]     = r;
-      frameBytes[base + pIdx * 3 + 1] = g;
-      frameBytes[base + pIdx * 3 + 2] = b;
+  if (!hasMappedGroups) {
+    // No reliable physical slot mapping yet: mirror content to all slots so
+    // users still see virtual-map output while mapping is incomplete.
+    const slotCount = Math.max(1, Math.floor(requiredLeds / LEDS_PER_TILE));
+    for (let slot = 0; slot < slotCount; slot += 1) {
+      const tileId = chain[slot % chain.length] || masterId;
+      const pixels = getTilePixelRgb(tileId);
+      const base = slot * LEDS_PER_TILE * 3;
+      pixels.forEach(([r, g, b], pIdx) => {
+        frameBytes[base + pIdx * 3] = r;
+        frameBytes[base + pIdx * 3 + 1] = g;
+        frameBytes[base + pIdx * 3 + 2] = b;
+      });
+    }
+  } else {
+    chain.forEach((tileId, tileIdx) => {
+      const ledGroup = tileGroupById.get(tileId);
+      const slot = Number.isInteger(ledGroup) && ledGroup >= 1 ? (ledGroup - 1) : tileIdx;
+      if (slot >= requiredLeds / LEDS_PER_TILE) return;
+      const pixels = getTilePixelRgb(tileId);
+      const base = slot * LEDS_PER_TILE * 3;
+      pixels.forEach(([r, g, b], pIdx) => {
+        frameBytes[base + pIdx * 3]     = r;
+        frameBytes[base + pIdx * 3 + 1] = g;
+        frameBytes[base + pIdx * 3 + 2] = b;
+      });
     });
-  });
+  }
 
-  const token = await twinklyToken(ip);
-  await twinklySetRtMode(ip, token);
-  await twinklyPushFrame(ip, token, frameBytes);
+  const nowMs = Date.now();
+  const rtAgeMs = nowMs - Number(state.twinklyRtModeAt[ip] || 0);
+  const refreshRt = !state.twinklyRtMode[ip] || rtAgeMs > 5000;
+  const enteringRt = !state.twinklyRtMode[ip];
+  try {
+    if (refreshRt) {
+      await twinklySetRtMode(ip, token);
+      state.twinklyRtMode[ip] = true;
+      state.twinklyRtModeAt[ip] = nowMs;
+    }
+
+    await twinklyPushFrame(ip, token, frameBytes);
+
+    // Prime the stream on first entry to RT mode to avoid occasional stale-frame latching.
+    if (enteringRt) {
+      await twinklyPushFrame(ip, token, frameBytes);
+    }
+  } catch (err) {
+    state.twinklyRtMode[ip] = false;
+    state.twinklyRtModeAt[ip] = 0;
+    // One compatibility retry: re-enter RT mode and resend frame once.
+    try {
+      await twinklySetRtMode(ip, token);
+      state.twinklyRtMode[ip] = true;
+      state.twinklyRtModeAt[ip] = Date.now();
+      await twinklyPushFrame(ip, token, frameBytes);
+      return;
+    } catch (_retryErr) {
+      state.twinklyRtMode[ip] = false;
+      state.twinklyRtModeAt[ip] = 0;
+      throw new Error(
+        `${err.message} (leds=${requiredLeds}, bytes=${frameBytes.length}, strategy=${hasMappedGroups ? "mapped-groups" : "broadcast-slots"})`
+      );
+    }
+  }
+
+  return {
+    ip,
+    strategy: hasMappedGroups ? "mapped-groups" : "broadcast-slots",
+  };
 }
 
-async function pushAllTilesToHardware() {
-  const masters = state.tiles.filter((t) => t.isMaster && state.masterIPs[t.id]);
+async function pushAllTilesToHardware(options = {}) {
+  const quiet = Boolean(options.quiet);
+  const startedAt = performance.now();
+  const masters = Object.keys(state.masterIPs || {})
+    .map((k) => Number(k))
+    .filter((id) => Number.isInteger(id) && Boolean(getTileById(id)));
   if (!masters.length) {
-    el.pushStatus.textContent = "No masters with IP addresses assigned.";
+    if (!quiet) setPushStatus("No masters with IP addresses assigned.");
     return;
   }
-  el.pushStatus.textContent = `Pushing to ${masters.length} master(s)…`;
+  if (!quiet) setPushStatus(`Pushing to ${masters.length} master(s)...`);
   const errors = [];
-  await Promise.all(masters.map((m) =>
-    pushMasterToHardware(m.id).catch((err) => errors.push(`${state.masterIPs[m.id]}: ${err.message}`))
+  const masterPushMeta = [];
+  await Promise.all(masters.map((masterId) =>
+    pushMasterToHardware(masterId)
+      .then((meta) => {
+        if (meta) masterPushMeta.push(meta);
+      })
+      .catch((err) => {
+        const ip = state.masterIPs[masterId];
+        if (ip) {
+          state.twinklyRtMode[ip] = false;
+          state.twinklyRtModeAt[ip] = 0;
+          state.twinklyRtFrameFormat[ip] = "";
+        }
+        errors.push(`${ip}: ${err.message}`);
+      })
   ));
-  el.pushStatus.textContent = errors.length
-    ? `Errors: ${errors.join(" | ")}`
-    : `Pushed to ${masters.length} master(s) OK.`;
+  state.mirrorStats.lastDurationMs = performance.now() - startedAt;
+  if (errors.length) {
+    state.mirrorStats.errCount += errors.length;
+    state.mirrorStats.lastErrAt = Date.now();
+    state.mirrorStats.lastErrText = errors[errors.length - 1];
+    setPushStatus(`Errors: ${errors.join(" | ")}${formatMirrorStatsSuffix()}`);
+    postMirrorError("push-errors", {
+      errors,
+      durationMs: Math.round(state.mirrorStats.lastDurationMs),
+      masters,
+      animationActive: state.animation.active,
+      demoPreset: state.demoPreset,
+      wizardActive: state.wizard.active,
+      livePushActive: state.livePushActive,
+    });
+  } else if (!quiet) {
+    state.mirrorStats.okCount += 1;
+    state.mirrorStats.lastOkAt = Date.now();
+    state.mirrorStats.lastErrText = "";
+    setPushStatus(`Pushed to ${masters.length} master(s) OK.${formatMirrorStatsSuffix()}`);
+    postMirrorInfo("manual-push-ok", {
+      durationMs: Math.round(state.mirrorStats.lastDurationMs),
+      masters,
+      stats: state.mirrorStats,
+      animationActive: state.animation.active,
+      demoPreset: state.demoPreset,
+    }, 1500);
+  } else {
+    state.mirrorStats.okCount += 1;
+    state.mirrorStats.lastOkAt = Date.now();
+    const rtFormats = masters.reduce((acc, id) => {
+      const ip = state.masterIPs[id];
+      if (!ip) return acc;
+      acc[ip] = state.twinklyRtFrameFormat[ip] || "unknown";
+      return acc;
+    }, {});
+    postMirrorInfo("auto-push-ok", {
+      durationMs: Math.round(state.mirrorStats.lastDurationMs),
+      masters,
+      okCount: state.mirrorStats.okCount,
+      animationActive: state.animation.active,
+      demoPreset: state.demoPreset,
+      rtFormats,
+      strategies: masterPushMeta,
+    }, 5000);
+  }
 }
 
 function startLivePush() {
@@ -2733,7 +3223,7 @@ function stopLivePush() {
   state.livePushRafId = null;
   el.btnToggleLivePush.textContent = "▶ Live Push";
   el.btnToggleLivePush.classList.remove("danger");
-  el.pushStatus.textContent = "Live push stopped.";
+  setPushStatus("Live push stopped.");
   updateGeneralButtonStates();
 }
 
@@ -2755,7 +3245,14 @@ function getTilePixelColors(tileId) {
       const sourceX = state.demoOffsetX + wallX;
       const sourceY = state.demoOffsetY + wallY;
       const animated = getAnimatedPixelColorAtWall(wallX, wallY);
-      row.push(animated || getPixelColorAtSource(sourceX, sourceY));
+      const baseColor = getPixelColorAtSource(sourceX, sourceY);
+      row.push(
+        animated || (
+          state.animation.active
+            ? animatedBackgroundColor(baseColor, wallX, wallY)
+            : baseColor
+        )
+      );
     }
     out.push(row);
   }
@@ -2922,6 +3419,7 @@ function render() {
   }
 
   renderTileDetails();
+  maybeAutoSyncHardwareFromVirtualMap();
 }
 
 function renderTileDetails() {
@@ -2950,6 +3448,7 @@ function renderTileDetails() {
     `mapped master tile: ${Number.isInteger(assignment?.masterTileId) ? assignment.masterTileId : "none"}`,
     `mapped master ip: ${assignment?.masterIp || "none"}`,
     `segment: ${Number.isInteger(assignment?.segment) ? assignment.segment : "none"}`,
+    `led group: ${Number.isInteger(assignment?.ledGroup) ? assignment.ledGroup : "none"}`,
   ];
 
   const lock = state.wizard.lockedTiles[String(tile.id)];
@@ -3014,7 +3513,11 @@ function buildExportPayload(includeGeneratedAt = true) {
 
   const masters = state.tiles
     .filter((t) => t.isMaster)
-    .map((t) => ({ id: t.id, row: t.row, col: t.col, ip: state.masterIPs[t.id] || null, leds: state.masterLeds[t.id] || null }));
+    .map((t) => ({
+      id: t.id,
+      ip: state.masterIPs[t.id] || null,
+      leds: state.masterLeds[t.id] || null,
+    }));
 
   const tiles = state.tiles.map((tile) => {
     const assignment = assignmentMap.get(tile.id) || null;
@@ -3023,35 +3526,14 @@ function buildExportPayload(includeGeneratedAt = true) {
       row: tile.row,
       col: tile.col,
       rotation: state.tileRotations[tile.id] || 0,
-      isMaster: tile.isMaster,
       masterId: Number.isInteger(assignment?.masterTileId) ? assignment.masterTileId : null,
-      masterIp: assignment?.masterIp || null,
       segment: Number.isInteger(assignment?.segment) ? assignment.segment : null,
+      ledGroup: Number.isInteger(assignment?.ledGroup) ? assignment.ledGroup : null,
     };
   });
 
-  const masterMappings = masters.map((master) => ({
-    masterId: master.id,
-    masterIp: master.ip || null,
-    tiles: tiles
-      .filter((tile) => tile.masterId === master.id)
-      .sort((a, b) => {
-        if (Number.isInteger(a.segment) && Number.isInteger(b.segment)) return a.segment - b.segment;
-        if (Number.isInteger(a.segment)) return -1;
-        if (Number.isInteger(b.segment)) return 1;
-        return a.tileId - b.tileId;
-      })
-      .map((tile) => ({
-        tileId: tile.tileId,
-        row: tile.row,
-        col: tile.col,
-        rotation: tile.rotation,
-        segment: tile.segment,
-      })),
-  }));
-
   return {
-    version: 3,
+    version: 4,
     generatedAt: includeGeneratedAt ? new Date().toISOString() : "preview",
     wall: {
       width: state.cols,
@@ -3059,19 +3541,8 @@ function buildExportPayload(includeGeneratedAt = true) {
       tileCount: state.tiles.length,
       expectedMasters: state.expectedMasters,
     },
-    demo: {
-      preset: state.demoPreset,
-      offsetX: state.demoOffsetX,
-      offsetY: state.demoOffsetY,
-      imageUrl: state.sourceFrame?.imageUrl || null,
-      sourcePage: state.sourceFrame?.sourcePage || null,
-      label: state.sourceFrame?.label || null,
-      custom: Boolean(state.sourceFrame?.custom),
-      animationActive: state.animation.active,
-    },
     masters,
     tiles,
-    masterMappings,
   };
 }
 
@@ -3117,13 +3588,13 @@ function rebuildGrid(rows, cols, preserveMasters = false) {
 }
 
 async function importData(data) {
-  if (!data || (!data.wall && !data.grid) || !Array.isArray(data.masters)) {
-    throw new Error("Invalid mapping file format.");
+  if (!data || !data.wall || !Array.isArray(data.masters) || !Array.isArray(data.tiles)) {
+    throw new Error("Invalid mapping file format. Expected wall + masters + tiles.");
   }
 
-  const rows = Number(data.wall?.height ?? data.grid?.rows);
-  const cols = Number(data.wall?.width ?? data.grid?.cols);
-  const expectedMasters = Number(data.wall?.expectedMasters ?? data.grid?.expectedMasters ?? data.masters.length ?? 3);
+  const rows = Number(data.wall.height);
+  const cols = Number(data.wall.width);
+  const expectedMasters = Number(data.wall.expectedMasters ?? data.masters.length ?? 3);
   if (!Number.isInteger(rows) || !Number.isInteger(cols) || rows < 1 || cols < 1) {
     throw new Error("Invalid grid size in file.");
   }
@@ -3137,66 +3608,56 @@ async function importData(data) {
 
   state.masterIPs = {};
   state.masterLeds = {};
+  state.twinklyRtMode = {};
+  state.twinklyRtModeAt = {};
+  state.twinklyRtFrameFormat = {};
   state.tileRotations = {};
   state.wizard.lockedTiles = {};
   state.wizard.assignments = [];
   state.wizard.segmentTileIds = {};
+
+  const masterIpById = new Map();
   for (const m of data.masters) {
     const tile = getTileById(Number(m.id));
     if (tile) {
       tile.isMaster = true;
       if (m.ip) state.masterIPs[tile.id] = m.ip;
       if (m.leds) state.masterLeds[tile.id] = m.leds;
-    }
-  }
-  if (Array.isArray(data.tiles)) {
-    for (const item of data.tiles) {
-      const tile = getTileById(Number(item.tileId));
-      if (!tile) continue;
-
-      if (typeof item.isMaster === "boolean") tile.isMaster = item.isMaster;
-
-      const rot = Number(item.rotation);
-      if ([0, 90, 180, 270].includes(rot)) {
-        state.tileRotations[tile.id] = rot;
-      }
-
-      const segment = Number(item.segment);
-      const masterIp = typeof item.masterIp === "string" ? item.masterIp : null;
-      if (masterIp && Number.isInteger(segment) && segment >= 0) {
-        state.wizard.assignments.push({
-          ip: masterIp,
-          segment,
-          tileId: tile.id,
-          role: segment === 0 ? "master" : "slave",
-        });
-        state.wizard.lockedTiles[String(tile.id)] = {
-          ip: masterIp,
-          segment,
-          role: segment === 0 ? "master" : "slave",
-          rotation: state.tileRotations[tile.id] || 0,
-        };
-      }
-    }
-    renderWizardProgressTable();
-  } else if (data.tileRotations && typeof data.tileRotations === "object") {
-    for (const [k, v] of Object.entries(data.tileRotations)) {
-      const numV = Number(v);
-      if ([0, 90, 180, 270].includes(numV)) state.tileRotations[Number(k)] = numV;
+      masterIpById.set(tile.id, m.ip || null);
     }
   }
 
-  const demo = data.demo || {};
-  if (typeof demo.preset === "string" && DEMOS[demo.preset]) {
-    state.demoPreset = demo.preset;
-    el.demoPreset.value = demo.preset;
-    await loadPresetFrame(demo.preset);
-  }
+  for (const item of data.tiles) {
+    const tile = getTileById(Number(item.tileId));
+    if (!tile) continue;
 
-  if (Number.isInteger(demo.offsetX)) state.demoOffsetX = demo.offsetX;
-  if (Number.isInteger(demo.offsetY)) state.demoOffsetY = demo.offsetY;
-  clampDemoOffsets();
-  renderDemoInfo();
+    const rot = Number(item.rotation);
+    if ([0, 90, 180, 270].includes(rot)) {
+      state.tileRotations[tile.id] = rot;
+    }
+
+    const segment = Number(item.segment);
+    const masterId = Number(item.masterId);
+    const ledGroup = Number(item.ledGroup);
+    const masterIp = Number.isInteger(masterId) ? (masterIpById.get(masterId) || null) : null;
+    if (masterIp && Number.isInteger(segment) && segment >= 0) {
+      state.wizard.assignments.push({
+        ip: masterIp,
+        segment,
+        tileId: tile.id,
+        role: segment === 0 ? "master" : "slave",
+        ledGroup: Number.isInteger(ledGroup) && ledGroup >= 1 ? ledGroup : null,
+      });
+      state.wizard.lockedTiles[String(tile.id)] = {
+        ip: masterIp,
+        segment,
+        role: segment === 0 ? "master" : "slave",
+        rotation: state.tileRotations[tile.id] || 0,
+        ledGroup: Number.isInteger(ledGroup) && ledGroup >= 1 ? ledGroup : null,
+      };
+    }
+  }
+  renderWizardProgressTable();
 
   setStatus("Mapping imported.");
   render();
@@ -3395,7 +3856,7 @@ function resetAll() {
   el.jsonOutput.value = "";
   loadPresetFrame("mario");
   setStatus("Reset to 7x5.");
-  localStorage.removeItem(MAP_AUTOSAVE_KEY);
+  saveMapAutosave();
 }
 
 function beginDemoDrag(event) {
@@ -4476,6 +4937,12 @@ function bindEvents() {
     });
   }
 
+  if (el.btnWizardDone) {
+    el.btnWizardDone.addEventListener("click", () => {
+      wizardDone();
+    });
+  }
+
   if (el.btnWizardCancel) {
     el.btnWizardCancel.addEventListener("click", () => {
       wizardCancel();
@@ -4539,10 +5006,66 @@ function bindEvents() {
     }
   });
 
+  if (el.configProfileSelect) {
+    el.configProfileSelect.addEventListener("change", () => {
+      const selectedId = el.configProfileSelect.value;
+      const selected = (state.mapProfiles.profiles || []).find((p) => p.id === selectedId);
+      if (selected && el.configProfileName) {
+        el.configProfileName.value = selected.name;
+      }
+      if (el.profileSaveOnExit) {
+        el.profileSaveOnExit.checked = Boolean(selected ? selected.autoSaveOnExit !== false : false);
+      }
+      updateGeneralButtonStates();
+    });
+  }
+
+  if (el.btnSaveProfile) {
+    el.btnSaveProfile.addEventListener("click", () => {
+      saveCurrentAsProfile();
+    });
+  }
+
+  if (el.btnLoadProfile) {
+    el.btnLoadProfile.addEventListener("click", () => {
+      const id = el.configProfileSelect?.value || "";
+      loadProfileById(id, true);
+    });
+  }
+
+  if (el.btnSetDefaultProfile) {
+    el.btnSetDefaultProfile.addEventListener("click", () => {
+      const id = el.configProfileSelect?.value || "";
+      setDefaultProfileById(id);
+    });
+  }
+
+  if (el.btnRenameProfile) {
+    el.btnRenameProfile.addEventListener("click", () => {
+      renameSelectedProfile();
+    });
+  }
+
+  if (el.btnDeleteProfile) {
+    el.btnDeleteProfile.addEventListener("click", () => {
+      deleteSelectedProfile();
+    });
+  }
+
+  if (el.profileSaveOnExit) {
+    el.profileSaveOnExit.addEventListener("change", () => {
+      setSelectedProfileAutoSaveOnExit(el.profileSaveOnExit.checked);
+    });
+  }
+
   el.gridSvg.addEventListener("pointerdown", beginDemoDrag);
   el.gridSvg.addEventListener("pointermove", moveDemoDrag);
   window.addEventListener("pointerup", endDemoDrag);
   window.addEventListener("pointercancel", endDemoDrag);
+  window.addEventListener("beforeunload", () => {
+    saveMapAutosave();
+    maybePersistActiveProfileOnExit();
+  });
 
   el.btnCharSearch.addEventListener("click", runCharacterSearch);
   el.charSearchInput.addEventListener("input", updateGeneralButtonStates);
@@ -4670,149 +5193,486 @@ function bindEvents() {
 }
 
 const MAP_AUTOSAVE_KEY = "gamewall.map.autosave.v1";
+const MAP_PROFILE_INDEX_KEY = "gamewall.map.profiles.index.v1";
+const MAP_PROFILE_PAYLOAD_PREFIX = "gamewall.map.profile.v1.";
+
+function mapProfilePayloadKey(profileId) {
+  return `${MAP_PROFILE_PAYLOAD_PREFIX}${profileId}`;
+}
+
+function buildMapSnapshot() {
+  return {
+    rows: state.rows,
+    cols: state.cols,
+    expectedMasters: state.expectedMasters,
+    masters: state.tiles
+      .filter((t) => t.isMaster)
+      .map((t) => ({
+        id: t.id, row: t.row, col: t.col,
+        ip: state.masterIPs[t.id] || null,
+        leds: state.masterLeds[t.id] || null,
+      })),
+    tileRotations: { ...state.tileRotations },
+    tiles: state.tiles.map((tile) => {
+      const lock = state.wizard.lockedTiles[String(tile.id)] || null;
+      return {
+        tileId: tile.id,
+        row: tile.row,
+        col: tile.col,
+        isMaster: tile.isMaster,
+        rotation: state.tileRotations[tile.id] || 0,
+        masterIp: lock?.ip || (tile.isMaster ? (state.masterIPs[tile.id] || null) : null),
+        segment: Number.isInteger(lock?.segment) ? lock.segment : (tile.isMaster ? 0 : null),
+        ledGroup: Number.isInteger(lock?.ledGroup) ? lock.ledGroup : null,
+      };
+    }),
+    wizard: {
+      selectedIp: state.wizard.selectedIp,
+      lockedTiles: { ...state.wizard.lockedTiles },
+      assignments: state.wizard.assignments.slice(),
+      tileCountOverrides: { ...state.wizard.tileCountOverrides },
+    },
+    demoPreset: state.demoPreset,
+    demoOffsetX: state.demoOffsetX,
+    demoOffsetY: state.demoOffsetY,
+  };
+}
+
+function loadMapProfileIndex() {
+  try {
+    const raw = localStorage.getItem(MAP_PROFILE_INDEX_KEY);
+    if (!raw) return { profiles: [], defaultProfileId: "", activeProfileId: "" };
+    const parsed = JSON.parse(raw);
+    const profiles = Array.isArray(parsed?.profiles)
+      ? parsed.profiles
+          .filter((p) => p && typeof p.id === "string" && typeof p.name === "string")
+          .map((p) => ({
+            id: p.id,
+            name: p.name,
+            createdAt: p.createdAt || null,
+            updatedAt: p.updatedAt || null,
+            autoSaveOnExit: typeof p.autoSaveOnExit === "boolean" ? p.autoSaveOnExit : true,
+          }))
+      : [];
+    return {
+      profiles,
+      defaultProfileId: typeof parsed?.defaultProfileId === "string" ? parsed.defaultProfileId : "",
+      activeProfileId: typeof parsed?.activeProfileId === "string" ? parsed.activeProfileId : "",
+    };
+  } catch (_e) {
+    return { profiles: [], defaultProfileId: "", activeProfileId: "" };
+  }
+}
+
+function persistMapProfileIndex() {
+  const payload = {
+    version: 1,
+    defaultProfileId: state.mapProfiles.defaultProfileId || "",
+    activeProfileId: state.mapProfiles.activeProfileId || "",
+    profiles: (state.mapProfiles.profiles || []).map((p) => ({
+      id: p.id,
+      name: p.name,
+      createdAt: p.createdAt || null,
+      updatedAt: p.updatedAt || null,
+      autoSaveOnExit: typeof p.autoSaveOnExit === "boolean" ? p.autoSaveOnExit : true,
+    })),
+  };
+  localStorage.setItem(MAP_PROFILE_INDEX_KEY, JSON.stringify(payload));
+}
+
+function hydrateMapProfileState() {
+  const idx = loadMapProfileIndex();
+  state.mapProfiles.profiles = idx.profiles;
+  state.mapProfiles.defaultProfileId = idx.defaultProfileId;
+  state.mapProfiles.activeProfileId = idx.activeProfileId;
+}
+
+function renderProfileControls() {
+  if (!el.configProfileSelect) return;
+  const sel = el.configProfileSelect;
+  sel.innerHTML = "";
+
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = state.mapProfiles.profiles.length
+    ? "Select saved configuration..."
+    : "No saved configurations";
+  sel.appendChild(placeholder);
+
+  for (const profile of state.mapProfiles.profiles) {
+    const opt = document.createElement("option");
+    opt.value = profile.id;
+    const defaultTag = profile.id === state.mapProfiles.defaultProfileId ? " [startup]" : "";
+    const exitTag = profile.autoSaveOnExit === false ? " [manual-save]" : "";
+    opt.textContent = `${profile.name}${defaultTag}${exitTag}`;
+    sel.appendChild(opt);
+  }
+
+  if (state.mapProfiles.activeProfileId) {
+    sel.value = state.mapProfiles.activeProfileId;
+  }
+
+  const hasSelected = Boolean(sel.value);
+  const selected = (state.mapProfiles.profiles || []).find((p) => p.id === sel.value) || null;
+  if (el.configProfileName) {
+    el.configProfileName.value = selected ? selected.name : "";
+  }
+  if (el.btnLoadProfile) el.btnLoadProfile.disabled = !hasSelected;
+  if (el.btnSetDefaultProfile) el.btnSetDefaultProfile.disabled = !hasSelected;
+  if (el.btnRenameProfile) el.btnRenameProfile.disabled = !hasSelected;
+  if (el.btnDeleteProfile) el.btnDeleteProfile.disabled = !hasSelected;
+  if (el.profileSaveOnExit) {
+    el.profileSaveOnExit.disabled = !hasSelected;
+    el.profileSaveOnExit.checked = Boolean(selected ? selected.autoSaveOnExit !== false : false);
+  }
+}
+
+function touchProfileUpdatedAt(profileId) {
+  const profile = (state.mapProfiles.profiles || []).find((p) => p.id === profileId);
+  if (!profile) return;
+  profile.updatedAt = new Date().toISOString();
+  persistMapProfileIndex();
+}
+
+function persistProfilePayload(profileId) {
+  if (!profileId) return false;
+  const profile = (state.mapProfiles.profiles || []).find((p) => p.id === profileId) || null;
+  if (!profile) return false;
+  const payload = buildMapSnapshot();
+  localStorage.setItem(mapProfilePayloadKey(profileId), JSON.stringify(payload));
+  touchProfileUpdatedAt(profileId);
+  return true;
+}
 
 function saveMapAutosave() {
   try {
-    const payload = {
-      rows: state.rows,
-      cols: state.cols,
-      expectedMasters: state.expectedMasters,
-      masters: state.tiles
-        .filter((t) => t.isMaster)
-        .map((t) => ({
-          id: t.id, row: t.row, col: t.col,
-          ip: state.masterIPs[t.id] || null,
-          leds: state.masterLeds[t.id] || null,
-        })),
-      tileRotations: { ...state.tileRotations },
-      tiles: state.tiles.map((tile) => {
-        const lock = state.wizard.lockedTiles[String(tile.id)] || null;
-        return {
-          tileId: tile.id,
-          row: tile.row,
-          col: tile.col,
-          isMaster: tile.isMaster,
-          rotation: state.tileRotations[tile.id] || 0,
-          masterIp: lock?.ip || (tile.isMaster ? (state.masterIPs[tile.id] || null) : null),
-          segment: Number.isInteger(lock?.segment) ? lock.segment : (tile.isMaster ? 0 : null),
-        };
-      }),
-      wizard: {
-        selectedIp: state.wizard.selectedIp,
-        lockedTiles: { ...state.wizard.lockedTiles },
-        assignments: state.wizard.assignments.slice(),
-        tileCountOverrides: { ...state.wizard.tileCountOverrides },
-      },
-      demoPreset: state.demoPreset,
-      demoOffsetX: state.demoOffsetX,
-      demoOffsetY: state.demoOffsetY,
-    };
+    const payload = buildMapSnapshot();
     localStorage.setItem(MAP_AUTOSAVE_KEY, JSON.stringify(payload));
     renderExportPreview();
   } catch (_e) {}
 }
 
+function applyMapSnapshot(d) {
+  const rows = Number(d.rows);
+  const cols = Number(d.cols);
+  if (!rows || !cols || rows < 1 || cols < 1) return false;
+
+  state.expectedMasters = Number(d.expectedMasters) || 3;
+  el.mastersInput.value = String(state.expectedMasters);
+  el.rowsInput.value = String(rows);
+  el.colsInput.value = String(cols);
+  rebuildGrid(rows, cols, false);
+
+  state.masterIPs = {};
+  state.masterLeds = {};
+  state.tileRotations = {};
+  state.wizard.selectedIp = String(d.wizard?.selectedIp || "");
+  state.wizard.lockedTiles = {};
+  state.wizard.assignments = [];
+  state.wizard.tileCountOverrides = (d.wizard && typeof d.wizard.tileCountOverrides === "object" && d.wizard.tileCountOverrides)
+    ? d.wizard.tileCountOverrides
+    : {};
+  state.wizard.queueIps = [];
+  state.wizard.blinkTimerId = null;
+  state.wizard.blinkOn = false;
+  state.wizard.blinkInFlight = false;
+  state.wizard.segmentLedGroups = [];
+  state.wizard.segmentGroupSource = "fallback";
+  state.wizard.segmentResolvedGroupIndex = {};
+  state.wizard.currentProbeGroupIndex = null;
+  state.wizard.probeCursor = 0;
+  state.wizard.segmentTileIds = {};
+  state.wizard.skippedSegments = [];
+  state.wizard.currentIp = "";
+  state.wizard.startNonce = 0;
+  state.wizard.reportedLedCount = 0;
+  state.wizard.ledCount = 0;
+  state.wizard.totalSegments = 0;
+  state.wizard.currentSegment = 0;
+  state.wizard.yellowShown = false;
+  state.wizard.rawLedCount = 0;
+  state.wizard.active = false;
+  state.wizard.phase = "idle";
+  updateWizardDeviceSelect();
+  renderWizardProgressTable();
+  if (state.wizard.selectedIp && el.wizardDeviceSelect) {
+    el.wizardDeviceSelect.value = state.wizard.selectedIp;
+  }
+
+  for (const m of d.masters || []) {
+    const tile = getTileById(Number(m.id));
+    if (!tile) continue;
+    tile.isMaster = true;
+    if (m.ip) state.masterIPs[tile.id] = m.ip;
+    if (m.leds) state.masterLeds[tile.id] = m.leds;
+  }
+
+  const assignmentKeySet = new Set();
+  const pushAssignment = (ip, segment, tileId, ledGroup) => {
+    const key = `${ip}|${segment}`;
+    if (assignmentKeySet.has(key)) return;
+    assignmentKeySet.add(key);
+    state.wizard.assignments.push({
+      ip,
+      segment,
+      tileId,
+      role: segment === 0 ? "master" : "slave",
+      ledGroup: Number.isInteger(ledGroup) && ledGroup >= 1 ? ledGroup : null,
+    });
+  };
+
+  const wizardAssignments = Array.isArray(d.wizard?.assignments) ? d.wizard.assignments : [];
+  for (const item of wizardAssignments) {
+    const ip = typeof item.ip === "string" ? item.ip : null;
+    const segment = Number(item.segment);
+    const tileId = Number(item.tileId);
+    const ledGroup = Number(item.ledGroup);
+    if (!ip || !Number.isInteger(segment) || segment < 0 || !Number.isInteger(tileId)) continue;
+    const tile = getTileById(tileId);
+    if (!tile) continue;
+    if (segment === 0) {
+      tile.isMaster = true;
+      state.masterIPs[tile.id] = ip;
+    }
+    state.wizard.lockedTiles[String(tile.id)] = {
+      ip,
+      segment,
+      role: segment === 0 ? "master" : "slave",
+      rotation: state.tileRotations[tile.id] || 0,
+      ledGroup: Number.isInteger(ledGroup) && ledGroup >= 1 ? ledGroup : null,
+    };
+    pushAssignment(ip, segment, tile.id, ledGroup);
+  }
+
+  for (const item of d.tiles || []) {
+    const tile = getTileById(Number(item.tileId));
+    if (!tile) continue;
+    if (typeof item.isMaster === "boolean") tile.isMaster = item.isMaster;
+    const rot = Number(item.rotation);
+    if ([0, 90, 180, 270].includes(rot)) state.tileRotations[tile.id] = rot;
+    const ip = typeof item.masterIp === "string" ? item.masterIp : null;
+    const segment = Number(item.segment);
+    const ledGroup = Number(item.ledGroup);
+    if (ip && Number.isInteger(segment) && segment >= 0) {
+      if (segment === 0) {
+        tile.isMaster = true;
+        state.masterIPs[tile.id] = ip;
+      }
+      state.wizard.lockedTiles[String(tile.id)] = {
+        ip,
+        segment,
+        role: segment === 0 ? "master" : "slave",
+        rotation: state.tileRotations[tile.id] || 0,
+        ledGroup: Number.isInteger(ledGroup) && ledGroup >= 1 ? ledGroup : null,
+      };
+      pushAssignment(ip, segment, tile.id, ledGroup);
+    }
+  }
+
+  if (d.tileRotations && typeof d.tileRotations === "object") {
+    for (const [k, v] of Object.entries(d.tileRotations)) {
+      const numV = Number(v);
+      if ([0, 90, 180, 270].includes(numV)) state.tileRotations[Number(k)] = numV;
+    }
+  }
+  if (d.demoPreset && DEMOS[d.demoPreset]) {
+    state.demoPreset = d.demoPreset;
+    el.demoPreset.value = d.demoPreset;
+    loadPresetFrame(d.demoPreset);
+  }
+  if (Number.isInteger(d.demoOffsetX)) state.demoOffsetX = d.demoOffsetX;
+  if (Number.isInteger(d.demoOffsetY)) state.demoOffsetY = d.demoOffsetY;
+
+  clampDemoOffsets();
+  updateHeader();
+  render();
+  runValidation();
+  renderWizardProgressTable();
+  updateWizardControlStates();
+  updateGeneralButtonStates();
+  return true;
+}
+
+function saveCurrentAsProfile() {
+  const typedName = (el.configProfileName?.value || "").trim();
+  const selectedId = el.configProfileSelect?.value || "";
+  const nowIso = new Date().toISOString();
+
+  let profile = null;
+  if (typedName) {
+    profile = (state.mapProfiles.profiles || []).find((p) => p.name.toLowerCase() === typedName.toLowerCase()) || null;
+  }
+  if (!profile && selectedId) {
+    profile = (state.mapProfiles.profiles || []).find((p) => p.id === selectedId) || null;
+  }
+
+  if (!profile) {
+    const id = `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+    profile = {
+      id,
+      name: typedName || `Configuration ${state.mapProfiles.profiles.length + 1}`,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      autoSaveOnExit: true,
+    };
+    state.mapProfiles.profiles.push(profile);
+  } else {
+    if (typedName) profile.name = typedName;
+    profile.updatedAt = nowIso;
+    if (typeof profile.autoSaveOnExit !== "boolean") profile.autoSaveOnExit = true;
+  }
+
+  state.mapProfiles.activeProfileId = profile.id;
+  if (!state.mapProfiles.defaultProfileId) {
+    state.mapProfiles.defaultProfileId = profile.id;
+  }
+
+  persistProfilePayload(profile.id);
+
+  persistMapProfileIndex();
+  renderProfileControls();
+  if (el.configProfileName) el.configProfileName.value = "";
+  saveMapAutosave();
+  setStatus(`Saved configuration '${profile.name}'.`);
+}
+
+function renameSelectedProfile() {
+  const id = el.configProfileSelect?.value || "";
+  const profile = (state.mapProfiles.profiles || []).find((p) => p.id === id) || null;
+  if (!profile) {
+    setStatus("Select a saved configuration first.");
+    return;
+  }
+
+  const nextName = (el.configProfileName?.value || "").trim();
+  if (!nextName) {
+    setStatus("Enter a profile name first.");
+    return;
+  }
+
+  profile.name = nextName;
+  profile.updatedAt = new Date().toISOString();
+  persistMapProfileIndex();
+  renderProfileControls();
+  setStatus(`Renamed configuration to '${nextName}'.`);
+}
+
+function deleteSelectedProfile() {
+  const id = el.configProfileSelect?.value || "";
+  const idx = (state.mapProfiles.profiles || []).findIndex((p) => p.id === id);
+  if (idx < 0) {
+    setStatus("Select a saved configuration first.");
+    return;
+  }
+
+  const profile = state.mapProfiles.profiles[idx];
+  const confirmed = window.confirm(`Delete configuration '${profile.name}'?`);
+  if (!confirmed) return;
+
+  state.mapProfiles.profiles.splice(idx, 1);
+  localStorage.removeItem(mapProfilePayloadKey(id));
+
+  if (state.mapProfiles.defaultProfileId === id) {
+    state.mapProfiles.defaultProfileId = state.mapProfiles.profiles[0]?.id || "";
+  }
+  if (state.mapProfiles.activeProfileId === id) {
+    state.mapProfiles.activeProfileId = state.mapProfiles.defaultProfileId || state.mapProfiles.profiles[0]?.id || "";
+  }
+
+  persistMapProfileIndex();
+  renderProfileControls();
+  if (el.configProfileName) el.configProfileName.value = "";
+  setStatus(`Deleted configuration '${profile.name}'.`);
+}
+
+function setSelectedProfileAutoSaveOnExit(enabled) {
+  const id = el.configProfileSelect?.value || "";
+  const profile = (state.mapProfiles.profiles || []).find((p) => p.id === id) || null;
+  if (!profile) {
+    setStatus("Select a saved configuration first.");
+    return;
+  }
+  profile.autoSaveOnExit = Boolean(enabled);
+  profile.updatedAt = new Date().toISOString();
+  persistMapProfileIndex();
+  renderProfileControls();
+  setStatus(`Save on exit ${profile.autoSaveOnExit ? "enabled" : "disabled"} for '${profile.name}'.`);
+}
+
+function maybePersistActiveProfileOnExit() {
+  const active = getActiveMapProfile();
+  if (!active) return;
+  if (active.autoSaveOnExit === false) return;
+  try {
+    persistProfilePayload(active.id);
+  } catch (_e) {
+    // Ignore storage errors during unload.
+  }
+}
+
+function loadProfileById(profileId, announce = true) {
+  const profile = (state.mapProfiles.profiles || []).find((p) => p.id === profileId);
+  if (!profile) {
+    setStatus("Select a saved configuration first.");
+    return false;
+  }
+  try {
+    const raw = localStorage.getItem(mapProfilePayloadKey(profileId));
+    if (!raw) {
+      setStatus(`Configuration '${profile.name}' has no saved payload.`);
+      return false;
+    }
+    const parsed = JSON.parse(raw);
+    if (!applyMapSnapshot(parsed)) {
+      setStatus(`Configuration '${profile.name}' is invalid.`);
+      return false;
+    }
+    state.mapProfiles.activeProfileId = profileId;
+    persistMapProfileIndex();
+    renderProfileControls();
+    if (announce) setStatus(`Loaded configuration '${profile.name}'.`);
+    return true;
+  } catch (_e) {
+    setStatus(`Failed to load configuration '${profile.name}'.`);
+    return false;
+  }
+}
+
+function setDefaultProfileById(profileId) {
+  const profile = (state.mapProfiles.profiles || []).find((p) => p.id === profileId);
+  if (!profile) {
+    setStatus("Select a saved configuration first.");
+    return;
+  }
+  state.mapProfiles.defaultProfileId = profile.id;
+  if (!state.mapProfiles.activeProfileId) state.mapProfiles.activeProfileId = profile.id;
+  persistMapProfileIndex();
+  renderProfileControls();
+  setStatus(`Startup default set to '${profile.name}'.`);
+}
+
 function restoreMapAutosave() {
+  hydrateMapProfileState();
+  renderProfileControls();
+
+  const preferred =
+    state.mapProfiles.defaultProfileId
+    || state.mapProfiles.activeProfileId
+    || (state.mapProfiles.profiles[0] ? state.mapProfiles.profiles[0].id : "");
+
+  if (preferred && loadProfileById(preferred, false)) {
+    const active = (state.mapProfiles.profiles || []).find((p) => p.id === preferred);
+    if (active) {
+      setStatus(`Loaded startup configuration '${active.name}'.`);
+      return true;
+    }
+  }
+
   try {
     const raw = localStorage.getItem(MAP_AUTOSAVE_KEY);
     if (!raw) return false;
     const d = JSON.parse(raw);
-    const rows = Number(d.rows);
-    const cols = Number(d.cols);
-    if (!rows || !cols || rows < 1 || cols < 1) return false;
-
-    state.expectedMasters = Number(d.expectedMasters) || 3;
-    el.mastersInput.value = String(state.expectedMasters);
-    el.rowsInput.value = String(rows);
-    el.colsInput.value = String(cols);
-    rebuildGrid(rows, cols, false);
-
-    state.masterIPs = {};
-    state.masterLeds = {};
-    state.tileRotations = {};
-    state.wizard.selectedIp = String(d.wizard?.selectedIp || "");
-    state.wizard.lockedTiles = (d.wizard && typeof d.wizard.lockedTiles === "object" && d.wizard.lockedTiles)
-      ? d.wizard.lockedTiles
-      : {};
-    state.wizard.assignments = Array.isArray(d.wizard?.assignments) ? d.wizard.assignments : [];
-    state.wizard.tileCountOverrides = (d.wizard && typeof d.wizard.tileCountOverrides === "object" && d.wizard.tileCountOverrides)
-      ? d.wizard.tileCountOverrides
-      : {};
-    state.wizard.queueIps = [];
-    state.wizard.blinkTimerId = null;
-    state.wizard.blinkOn = false;
-    state.wizard.blinkInFlight = false;
-    state.wizard.segmentLedGroups = [];
-    state.wizard.segmentGroupSource = "fallback";
-    state.wizard.segmentResolvedGroupIndex = {};
-    state.wizard.currentProbeGroupIndex = null;
-    state.wizard.probeCursor = 0;
-    state.wizard.segmentTileIds = {};
-    state.wizard.skippedSegments = [];
-    state.wizard.currentIp = "";
-    state.wizard.startNonce = 0;
-    state.wizard.reportedLedCount = 0;
-    state.wizard.ledCount = 0;
-    state.wizard.totalSegments = 0;
-    state.wizard.currentSegment = 0;
-    state.wizard.yellowShown = false;
-    state.wizard.rawLedCount = 0;
-    state.wizard.active = false;
-    state.wizard.phase = "idle";
-    updateWizardDeviceSelect();
-    renderWizardProgressTable();
-    if (state.wizard.selectedIp && el.wizardDeviceSelect) {
-      el.wizardDeviceSelect.value = state.wizard.selectedIp;
-    }
-    for (const m of d.masters || []) {
-      const tile = getTileById(Number(m.id));
-      if (tile) {
-        tile.isMaster = true;
-        if (m.ip) state.masterIPs[tile.id] = m.ip;
-        if (m.leds) state.masterLeds[tile.id] = m.leds;
-      }
-    }
-
-    for (const item of d.tiles || []) {
-      const tile = getTileById(Number(item.tileId));
-      if (!tile) continue;
-      if (typeof item.isMaster === "boolean") tile.isMaster = item.isMaster;
-      const rot = Number(item.rotation);
-      if ([0, 90, 180, 270].includes(rot)) state.tileRotations[tile.id] = rot;
-      const ip = typeof item.masterIp === "string" ? item.masterIp : null;
-      const segment = Number(item.segment);
-      if (ip && Number.isInteger(segment) && segment >= 0) {
-        state.wizard.lockedTiles[String(tile.id)] = {
-          ip,
-          segment,
-          role: segment === 0 ? "master" : "slave",
-          rotation: state.tileRotations[tile.id] || 0,
-        };
-        state.wizard.assignments.push({
-          ip,
-          segment,
-          tileId: tile.id,
-          role: segment === 0 ? "master" : "slave",
-        });
-      }
-    }
-    if (d.tileRotations && typeof d.tileRotations === "object") {
-      for (const [k, v] of Object.entries(d.tileRotations)) {
-        const numV = Number(v);
-        if ([0, 90, 180, 270].includes(numV)) state.tileRotations[Number(k)] = numV;
-      }
-    }
-    if (d.demoPreset && DEMOS[d.demoPreset]) {
-      state.demoPreset = d.demoPreset;
-      el.demoPreset.value = d.demoPreset;
-      loadPresetFrame(d.demoPreset);
-    }
-    if (Number.isInteger(d.demoOffsetX)) state.demoOffsetX = d.demoOffsetX;
-    if (Number.isInteger(d.demoOffsetY)) state.demoOffsetY = d.demoOffsetY;
-    clampDemoOffsets();
-    updateHeader();
-    render();
-    runValidation();
+    if (!applyMapSnapshot(d)) return false;
     setStatus("Map restored from last session.");
     return true;
   } catch (_e) {
@@ -4826,6 +5686,7 @@ async function init() {
   renderActionSelect();
   renderActionTimeline();
   renderCharacterSearchResults();
+  postClientLog("info", "app", "startup", { build: APP_BUILD });
   bindEvents();
   await restoreCharacterAutosaveIfAny();
   updateWizardDeviceSelect();
@@ -4838,9 +5699,33 @@ async function init() {
     await loadPresetFrame(state.demoPreset);
   }
 
-  setStatus("Ready. Set masters and map tile locations with the Hardware Wizard. Drag on the wall to pan the demo window.");
+  if (!state.sourceFrame) {
+    await loadPresetFrame(state.demoPreset);
+  }
+
+  const configuredMasterIds = new Set(
+    Object.keys(state.masterIPs || {})
+      .map((k) => Number(k))
+      .filter((id) => Number.isInteger(id) && Boolean(getTileById(id)))
+  );
+  for (const item of state.wizard.assignments || []) {
+    if (Number(item.segment) === 0 && Number.isInteger(item.tileId)) {
+      configuredMasterIds.add(item.tileId);
+      if (typeof item.ip === "string" && item.ip.trim()) {
+        state.masterIPs[item.tileId] = item.ip.trim();
+      }
+    }
+  }
+  const configuredMasters = configuredMasterIds.size;
+  if (configuredMasters > 0) {
+    setStatus(`Ready. ${configuredMasters} configured master(s) detected; virtual map will mirror to tiles while wizard is idle.`);
+  } else {
+    setStatus("Ready. Set masters and map tile locations with the Hardware Wizard. Drag on the wall to pan the demo window.");
+  }
   updateWizardControlStates();
   updateGeneralButtonStates();
+  ensurePassiveHardwareMirror();
+  maybeAutoSyncHardwareFromVirtualMap();
 }
 
 init();
