@@ -18,7 +18,7 @@
   <header class="app-header">
     <div>
       <p class="eyebrow">Twinkly Squares Planner</p>
-      <h1>GameWall Control + Tile Mapper <span id="headerSize">7x5</span></h1>
+      <h1>GameWall Control <span id="headerSize" hidden>7x5</span></h1>
       <p class="sub">Map <span id="headerTileCount">35</span> tiles in a <span id="headerSizeSub">7x5</span> wall and assign tile locations per master.</p>
     </div>
     <div class="header-actions">
@@ -179,10 +179,19 @@
   <main id="charactersView" class="view characters-view" hidden>
     <section class="panel characters-top">
       <h2>Characters</h2>
+      <div class="character-library-row">
+        <label>Character Library
+          <select id="characterSelect"></select>
+        </label>
+        <button id="btnCharacterNew" type="button">New Character</button>
+      </div>
       <p class="hint">Search Spriters Resource, download a sheet, auto-detect sprites, then build actions by dragging frames into a timeline.</p>
       <div class="character-search-row">
         <input id="charSearchInput" type="text" placeholder="Search character (e.g. sonic, mario, tails)" />
         <button id="btnCharSearch" type="button">Search Spriters Resource</button>
+      </div>
+      <div class="data-actions">
+        <button id="btnCharSearchMore" class="secondary" type="button">Load More Results</button>
       </div>
       <div class="character-search-row">
         <label class="import-btn">Load Sheet File
@@ -193,31 +202,29 @@
         </label>
       </div>
       <div class="data-actions">
-        <button id="btnSaveCharacterJson" type="button">Save Character JSON</button>
+        <button id="btnSaveCharacterJson" type="button">Save Character</button>
         <label class="import-btn">
-          Load Character JSON
+          Load Character JSON (legacy)
           <input id="loadCharacterJson" type="file" accept="application/json" />
         </label>
       </div>
       <div id="charSearchStatus" class="hint">No search yet.</div>
       <div id="charSearchResults" class="search-results"></div>
+      <div class="data-actions">
+        <button id="btnCharSearchMore" class="secondary" type="button">Load More Results</button>
+      </div>
     </section>
 
     <section class="panel characters-grid">
       <div class="characters-col">
         <h3>Detected Sprites</h3>
-        <div class="detect-controls">
-          <label>Detection Strictness
-            <input id="detectStrictness" type="range" min="0" max="1" step="0.05" value="0.65" />
-          </label>
-          <div id="detectStrictnessValue" class="hint">0.65</div>
-          <div class="data-actions">
-            <button id="btnDetectNow" type="button">Detect Now</button>
-            <button id="btnDetectSweep" class="secondary" type="button">Try 20 Strictness</button>
-          </div>
-          <div id="detectSummary" class="hint">Load a sheet, then tune strictness.</div>
-        </div>
+        <div id="detectSummary" class="hint">Load a sheet and choose sprites in the detection modal.</div>
         <div id="spriteSheetMeta" class="tile-details">No sheet loaded.</div>
+        <div class="data-actions">
+          <button id="btnSpriteSelectAll" class="secondary" type="button">Select All</button>
+          <button id="btnSpriteClearSelection" class="secondary" type="button">Clear</button>
+          <button id="btnSpriteDeleteSelected" class="danger" type="button">Delete Selected</button>
+        </div>
         <div id="spritePalette" class="sprite-palette"></div>
       </div>
 
@@ -240,14 +247,79 @@
         <h3>Preview</h3>
         <canvas id="charPreviewCanvas" width="320" height="220" aria-label="Character animation preview"></canvas>
         <div id="previewInfo" class="tile-details">No action selected.</div>
+        <h3>Sprite Editor</h3>
+        <div class="sprite-editor-controls">
+          <label>Preset
+            <select id="spriteEditorPreset">
+              <option value="8x8">8x8</option>
+              <option value="16x16" selected>16x16</option>
+              <option value="32x32">32x32</option>
+              <option value="64x64">64x64</option>
+            </select>
+          </label>
+          <label>Brush
+            <input id="spriteEditorBrush" type="number" min="1" max="16" value="1" />
+          </label>
+          <label>Zoom
+            <input id="spriteEditorZoom" type="number" min="8" max="40" value="16" />
+          </label>
+          <label>Color
+            <input id="spriteEditorColor" type="color" value="#ffffff" />
+          </label>
+        </div>
+        <div class="sprite-editor-actions">
+          <button id="btnSpriteEditorNew" class="secondary" type="button">New Canvas</button>
+          <label class="import-btn">Open Local Sprite
+            <input id="spriteEditorOpenFile" type="file" accept="image/png,image/webp,image/jpeg" />
+          </label>
+          <button id="btnSpriteEditorOpenSelected" class="secondary" type="button">Open Selected Sprite</button>
+          <button id="btnSpriteEditorPickBg" class="secondary" type="button">Select Background Color</button>
+          <button id="btnSpriteEditorUndo" class="secondary" type="button">Undo</button>
+          <button id="btnSpriteEditorRedo" class="secondary" type="button">Redo</button>
+          <button id="btnSpriteEditorClear" class="secondary" type="button">Clear</button>
+        </div>
+        <canvas id="spriteEditorCanvas" width="256" height="256" aria-label="Sprite editor canvas"></canvas>
+        <div class="sprite-editor-actions">
+          <label>Sprite Name
+            <input id="spriteEditorName" type="text" placeholder="hero_idle_01" />
+          </label>
+          <button id="btnSpriteEditorSave" type="button">Save</button>
+          <button id="btnSpriteEditorSaveAs" class="secondary" type="button">Save As New</button>
+        </div>
+        <div id="spriteEditorStatus" class="hint">Editor ready.</div>
       </div>
     </section>
   </main>
+
+  <div id="detectModal" class="detect-modal" hidden>
+    <div class="detect-modal-card" role="dialog" aria-modal="true" aria-labelledby="detectModalTitle">
+      <h3 id="detectModalTitle">Detect Sprites</h3>
+      <p id="detectModalStatus" class="hint">Adjust strictness, then choose sprites to import.</p>
+      <div class="detect-controls">
+        <label>Detection Strictness
+          <input id="detectStrictness" type="range" min="0" max="1" step="0.05" value="0.65" />
+        </label>
+        <div id="detectStrictnessValue" class="hint">0.65</div>
+        <div class="data-actions">
+          <button id="btnDetectNow" type="button">Detect Now</button>
+          <button id="btnDetectSweep" class="secondary" type="button">Try 20 Strictness</button>
+        </div>
+      </div>
+      <div id="detectModalGrid" class="detect-modal-grid"></div>
+      <div class="data-actions detect-modal-actions">
+        <button id="btnDetectSelectAll" class="secondary" type="button">Select All</button>
+        <button id="btnDetectSelectNone" class="secondary" type="button">Select None</button>
+        <button id="btnDetectImportSelected" type="button">Import Selected</button>
+        <button id="btnDetectAddAll" class="secondary" type="button">Add All</button>
+        <button id="btnDetectClose" class="secondary" type="button">Cancel</button>
+      </div>
+    </div>
+  </div>
 
   <footer class="app-footer">
     <p>Status: <span id="statusText">Ready.</span></p>
   </footer>
 
-  <script src="app.js?v=20260818-rtfix3"></script>
+  <script src="app.js?v=20260819-charstudio10"></script>
 </body>
 </html>

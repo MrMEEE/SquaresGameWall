@@ -1,5 +1,5 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
-const APP_BUILD = "20260818-rtfix3";
+const APP_BUILD = "20260818-charstudio1";
 const MAX_TILES_PER_MASTER = 15;
 const TILE_PIXEL_GRID = 8;
 const LEDS_PER_TILE = TILE_PIXEL_GRID * TILE_PIXEL_GRID;
@@ -137,15 +137,27 @@ const state = {
     rafId: null,
   },
   characters: {
+    activeSlug: "",
+    activeName: "",
+    library: [],
     searchResults: [],
+    searchQuery: "",
+    searchSeenAssetUrls: {},
+    searchSource: "",
+    searchBrowseNextPage: 1,
+    searchFallbackNextOffset: 0,
+    searchCanLoadMore: false,
+    searchLoadingMore: false,
     loadedAssetUrl: null,
     loadedSheetUrl: null,
+    loadedSheetFile: null,
     sheetDataUrl: null,
     sheetImageData: null,
     sprites: [],
+    selectedSpriteIds: {},
     detectStrictness: 0.65,
     actions: {
-      run: { name: "run", frames: [] },
+      run: { name: "run", frames: [], backgroundColor: null },
     },
     selectedAction: "run",
     previewRafId: null,
@@ -153,7 +165,29 @@ const state = {
     previewElapsed: 0,
     previewFrameIndex: 0,
     autosaveTimer: null,
-    autosaveStorageKey: "gamewall.characters.autosave.v1",
+    dirty: false,
+    saveInFlight: false,
+    editor: {
+      width: 16,
+      height: 16,
+      zoom: 16,
+      brushSize: 1,
+      color: "#ffffff",
+      pickBackgroundMode: false,
+      isDrawing: false,
+      imageData: null,
+      undoStack: [],
+      redoStack: [],
+      currentSpriteFileName: "",
+    },
+    detectModal: {
+      open: false,
+      imageData: null,
+      sourceMeta: null,
+      candidates: [],
+      selected: {},
+      loading: false,
+    },
   },
   mapProfiles: {
     profiles: [],
@@ -235,7 +269,10 @@ const el = {
   demoImageFile: document.getElementById("demoImageFile"),
   demoInfo: document.getElementById("demoInfo"),
   charSearchInput: document.getElementById("charSearchInput"),
+  characterSelect: document.getElementById("characterSelect"),
+  btnCharacterNew: document.getElementById("btnCharacterNew"),
   btnCharSearch: document.getElementById("btnCharSearch"),
+  btnCharSearchMore: document.getElementById("btnCharSearchMore"),
   charSheetFile: document.getElementById("charSheetFile"),
   characterFileName: document.getElementById("characterFileName"),
   btnSaveCharacterJson: document.getElementById("btnSaveCharacterJson"),
@@ -247,8 +284,19 @@ const el = {
   btnDetectNow: document.getElementById("btnDetectNow"),
   btnDetectSweep: document.getElementById("btnDetectSweep"),
   detectSummary: document.getElementById("detectSummary"),
+  detectModal: document.getElementById("detectModal"),
+  detectModalStatus: document.getElementById("detectModalStatus"),
+  detectModalGrid: document.getElementById("detectModalGrid"),
+  btnDetectImportSelected: document.getElementById("btnDetectImportSelected"),
+  btnDetectAddAll: document.getElementById("btnDetectAddAll"),
+  btnDetectSelectAll: document.getElementById("btnDetectSelectAll"),
+  btnDetectSelectNone: document.getElementById("btnDetectSelectNone"),
+  btnDetectClose: document.getElementById("btnDetectClose"),
   spriteSheetMeta: document.getElementById("spriteSheetMeta"),
   spritePalette: document.getElementById("spritePalette"),
+  btnSpriteSelectAll: document.getElementById("btnSpriteSelectAll"),
+  btnSpriteClearSelection: document.getElementById("btnSpriteClearSelection"),
+  btnSpriteDeleteSelected: document.getElementById("btnSpriteDeleteSelected"),
   actionNameInput: document.getElementById("actionNameInput"),
   btnCreateAction: document.getElementById("btnCreateAction"),
   actionSelect: document.getElementById("actionSelect"),
@@ -256,6 +304,22 @@ const el = {
   actionTimeline: document.getElementById("actionTimeline"),
   charPreviewCanvas: document.getElementById("charPreviewCanvas"),
   previewInfo: document.getElementById("previewInfo"),
+  spriteEditorCanvas: document.getElementById("spriteEditorCanvas"),
+  spriteEditorPreset: document.getElementById("spriteEditorPreset"),
+  spriteEditorBrush: document.getElementById("spriteEditorBrush"),
+  spriteEditorZoom: document.getElementById("spriteEditorZoom"),
+  spriteEditorColor: document.getElementById("spriteEditorColor"),
+  btnSpriteEditorNew: document.getElementById("btnSpriteEditorNew"),
+  spriteEditorOpenFile: document.getElementById("spriteEditorOpenFile"),
+  btnSpriteEditorOpenSelected: document.getElementById("btnSpriteEditorOpenSelected"),
+  btnSpriteEditorPickBg: document.getElementById("btnSpriteEditorPickBg"),
+  btnSpriteEditorUndo: document.getElementById("btnSpriteEditorUndo"),
+  btnSpriteEditorRedo: document.getElementById("btnSpriteEditorRedo"),
+  btnSpriteEditorClear: document.getElementById("btnSpriteEditorClear"),
+  spriteEditorName: document.getElementById("spriteEditorName"),
+  btnSpriteEditorSave: document.getElementById("btnSpriteEditorSave"),
+  btnSpriteEditorSaveAs: document.getElementById("btnSpriteEditorSaveAs"),
+  spriteEditorStatus: document.getElementById("spriteEditorStatus"),
 };
 
 function getActiveMapProfile() {
@@ -1595,11 +1659,30 @@ function updateGeneralButtonStates() {
   if (el.btnCharSearch) {
     el.btnCharSearch.disabled = !(el.charSearchInput?.value || "").trim();
   }
+  if (el.btnCharSearchMore) {
+    el.btnCharSearchMore.disabled = !state.characters.searchCanLoadMore || state.characters.searchLoadingMore;
+    el.btnCharSearchMore.textContent = state.characters.searchLoadingMore ? "Loading..." : "Load More Results";
+  }
 
   const hasSheet = Boolean(state.characters.sheetImageData);
   if (el.btnDetectNow) el.btnDetectNow.disabled = !hasSheet;
   if (el.btnDetectSweep) el.btnDetectSweep.disabled = !hasSheet;
-  if (el.btnSaveCharacterJson) el.btnSaveCharacterJson.disabled = !state.characters.sheetDataUrl;
+  if (el.btnSaveCharacterJson) el.btnSaveCharacterJson.disabled = !state.characters.activeSlug;
+  const selectedSpriteIds = Object.keys(state.characters.selectedSpriteIds || {}).filter((k) => state.characters.selectedSpriteIds[k]);
+  if (el.btnSpriteDeleteSelected) el.btnSpriteDeleteSelected.disabled = selectedSpriteIds.length === 0;
+  if (el.btnSpriteClearSelection) el.btnSpriteClearSelection.disabled = selectedSpriteIds.length === 0;
+  if (el.btnSpriteSelectAll) el.btnSpriteSelectAll.disabled = state.characters.sprites.length === 0;
+  if (el.btnSpriteEditorOpenSelected) el.btnSpriteEditorOpenSelected.disabled = selectedSpriteIds.length !== 1;
+  if (el.btnSpriteEditorPickBg) {
+    const hasAction = Boolean(getSelectedAction());
+    const hasImage = Boolean(state.characters.editor.imageData);
+    el.btnSpriteEditorPickBg.disabled = !(hasAction && hasImage);
+    el.btnSpriteEditorPickBg.textContent = state.characters.editor.pickBackgroundMode
+      ? "Click Pixel In Editor..."
+      : "Select Background Color";
+  }
+  if (el.btnSpriteEditorSave) el.btnSpriteEditorSave.disabled = !state.characters.activeSlug;
+  if (el.btnSpriteEditorSaveAs) el.btnSpriteEditorSaveAs.disabled = !state.characters.activeSlug;
 
   if (el.btnCreateAction) {
     el.btnCreateAction.disabled = !(el.actionNameInput?.value || "").trim();
@@ -1613,6 +1696,136 @@ function updateGeneralButtonStates() {
     if (el.btnDeleteProfile) el.btnDeleteProfile.disabled = !hasSelectedProfile;
     if (el.profileSaveOnExit) el.profileSaveOnExit.disabled = !hasSelectedProfile;
   }
+}
+
+function resetCharacterSearchState(query) {
+  state.characters.searchQuery = query;
+  state.characters.searchSeenAssetUrls = {};
+  state.characters.searchSource = "";
+  state.characters.searchBrowseNextPage = 1;
+  state.characters.searchFallbackNextOffset = 0;
+  state.characters.searchCanLoadMore = false;
+  state.characters.searchLoadingMore = false;
+}
+
+function buildSpritersBrowseUrl(query, pageNumber) {
+  const q = encodeURIComponent(String(query || "").trim());
+  const page = Number(pageNumber) || 1;
+  if (page <= 1) {
+    return `https://www.spriters-resource.com/browse/assets/?name=${q}&sect=1`;
+  }
+  return `https://www.spriters-resource.com/browse/assets/page-${page}/?name=${q}&sect=1`;
+}
+
+function looksLikeCloudflareChallenge(text) {
+  const body = String(text || "").toLowerCase();
+  return body.includes("just a moment") || body.includes("cf_chl_opt") || body.includes("challenges.cloudflare.com");
+}
+
+async function fetchSpritersBrowsePage(query, pageNumber) {
+  const url = buildSpritersBrowseUrl(query, pageNumber);
+  const text = await fetchTextViaProxy(url);
+  if (looksLikeCloudflareChallenge(text)) {
+    return { added: 0, blocked: true };
+  }
+
+  const entries = extractBrowseResultEntries(text);
+  const links = extractAssetLinksFromText(text).map((link) => ({
+    assetUrl: link,
+    label: labelFromAssetUrl(link),
+    thumbnailUrl: null,
+  }));
+  const added = appendCharacterSearchEntries(entries) + appendCharacterSearchEntries(links);
+  return { added, blocked: false };
+}
+
+function extractSpriteDatabaseSearchEntries(text) {
+  const entries = [];
+  const seen = new Set();
+  const rowRe = /<td>\s*<a\s+href='(file\/\d+)'>([\s\S]*?)<\/a>\s*<\/td>\s*<td>\s*<a\s+href='game\/\d+'>([\s\S]*?)<\/a>\s*<\/td>\s*<td>\s*<a\s+href='system\/\d+'>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = rowRe.exec(text)) !== null) {
+    const filePath = String(match[1] || "").trim();
+    const fileName = stripHtmlTags(match[2] || "");
+    const game = stripHtmlTags(match[3] || "");
+    const system = stripHtmlTags(match[4] || "");
+    const assetUrl = `https://spritedatabase.net/${filePath}`;
+    const key = assetUrl.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push({
+      assetUrl,
+      label: `${fileName} - ${game} (${system})`,
+      thumbnailUrl: "https://spritedatabase.net/layout/customs.gif",
+    });
+  }
+  return entries;
+}
+
+async function fetchSpriteDatabaseSearchEntries(query) {
+  const url = `/sdbsearch?query=${encodeURIComponent(query)}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error(`Sprite Database search failed (${res.status})`);
+  }
+  const text = await res.text();
+  return extractSpriteDatabaseSearchEntries(text);
+}
+
+function appendCharacterSearchEntries(entries) {
+  let added = 0;
+  for (const item of entries || []) {
+    const key = String(item?.assetUrl || "").toLowerCase();
+    if (!key) continue;
+    if (state.characters.searchSeenAssetUrls[key]) continue;
+    state.characters.searchSeenAssetUrls[key] = true;
+    state.characters.searchResults.push({
+      assetUrl: item.assetUrl,
+      label: item.label || labelFromAssetUrl(item.assetUrl),
+      thumbnailUrl: item.thumbnailUrl || null,
+    });
+    added += 1;
+  }
+  return added;
+}
+
+function normalizeActionMap(rawActions) {
+  const out = {};
+  const src = rawActions && typeof rawActions === "object" ? rawActions : {};
+  const keys = Object.keys(src);
+  if (!keys.length) {
+    out.run = { name: "run", frames: [], backgroundColor: null };
+    return out;
+  }
+
+  for (const key of keys) {
+    const item = src[key] || {};
+    out[key] = {
+      name: String(item.name || key),
+      frames: Array.isArray(item.frames) ? item.frames : [],
+      backgroundColor: typeof item.backgroundColor === "string" ? item.backgroundColor : null,
+    };
+  }
+
+  return out;
+}
+
+async function fetchDuckDuckGoSearchBatch(query, startOffset, pageCount = 3) {
+  const q = encodeURIComponent(query);
+  let added = 0;
+  for (let i = 0; i < pageCount; i += 1) {
+    const offset = startOffset + i * 30;
+    const ddgUrl = `https://duckduckgo.com/html/?q=site%3Aspriters-resource.com+asset+${q}&s=${offset}`;
+    try {
+      const text = await fetchTextViaProxy(ddgUrl);
+      const extra = extractDuckDuckGoAssetEntries(text);
+      added += appendCharacterSearchEntries(extra);
+    } catch (_e) {
+      // Keep partial batch results.
+    }
+  }
+  state.characters.searchFallbackNextOffset = startOffset + pageCount * 30;
+  return added;
 }
 
 let autoHardwarePushLastMs = 0;
@@ -3912,100 +4125,293 @@ function switchView(nextView) {
   updateGeneralButtonStates();
 }
 
+async function charactersApi(path, options = {}) {
+  const res = await fetch(`/api/characters/${path}`, {
+    method: options.method || "GET",
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(payload.error || `API failed (${res.status})`);
+  }
+  return payload;
+}
+
 function characterProjectSnapshot() {
   return {
-    version: 1,
-    savedAt: new Date().toISOString(),
+    version: 2,
+    slug: state.characters.activeSlug,
+    name: state.characters.activeName || state.characters.activeSlug,
+    detectStrictness: state.characters.detectStrictness,
+    selectedAction: state.characters.selectedAction,
     source: {
       assetUrl: state.characters.loadedAssetUrl,
       sheetUrl: state.characters.loadedSheetUrl,
-      sheetDataUrl: state.characters.sheetDataUrl,
+      sheetFile: state.characters.loadedSheetFile || null,
       width: state.characters.sheetImageData?.width || null,
       height: state.characters.sheetImageData?.height || null,
     },
-    sprites: state.characters.sprites.map((s) => ({ id: s.id, x: s.x, y: s.y, w: s.w, h: s.h })),
+    sprites: state.characters.sprites.map((s) => ({
+      spriteId: s.id,
+      fileName: s.fileName || null,
+      width: s.w,
+      height: s.h,
+      sourceType: s.sourceType || "detected",
+      x: Number.isFinite(s.x) ? s.x : null,
+      y: Number.isFinite(s.y) ? s.y : null,
+      w: s.w,
+      h: s.h,
+    })),
     actions: state.characters.actions,
-    selectedAction: state.characters.selectedAction,
-    detectStrictness: state.characters.detectStrictness,
   };
 }
 
-function persistCharacterAutosave() {
-  const key = state.characters.autosaveStorageKey;
-  const payload = characterProjectSnapshot();
-  localStorage.setItem(key, JSON.stringify(payload));
+async function persistCharacterAutosave() {
+  if (!state.characters.activeSlug) return;
+  state.characters.saveInFlight = true;
+  try {
+    const payload = characterProjectSnapshot();
+    await charactersApi(`${encodeURIComponent(state.characters.activeSlug)}/save`, {
+      method: "POST",
+      body: payload,
+    });
+    state.characters.dirty = false;
+  } finally {
+    state.characters.saveInFlight = false;
+  }
 }
 
 function scheduleCharacterAutosave() {
+  state.characters.dirty = true;
   if (state.characters.autosaveTimer != null) {
     clearTimeout(state.characters.autosaveTimer);
   }
 
   state.characters.autosaveTimer = setTimeout(() => {
     state.characters.autosaveTimer = null;
-    try {
-      persistCharacterAutosave();
-    } catch (_err) {
-      // Ignore storage failures silently.
-    }
-  }, 350);
+    persistCharacterAutosave().catch((err) => {
+      el.charSearchStatus.textContent = `Auto-save failed: ${err.message}`;
+    });
+  }, 500);
+}
+
+async function spriteRecordFromFile(slug, spriteMeta) {
+  const fileName = spriteMeta.fileName;
+  if (!fileName) return null;
+  const image = await loadImageFromUrl(`/characters/${encodeURIComponent(slug)}/sprites/${encodeURIComponent(fileName)}?t=${Date.now()}`);
+  const imageData = imageToImageData(image);
+  return {
+    id: Number(spriteMeta.spriteId),
+    fileName,
+    sourceType: spriteMeta.sourceType || "imported",
+    x: Number(spriteMeta.x),
+    y: Number(spriteMeta.y),
+    w: image.width,
+    h: image.height,
+    data: new Uint8ClampedArray(imageData.data),
+  };
 }
 
 async function applyCharacterProjectData(data) {
-  if (!data || !data.source || !data.source.sheetDataUrl || !Array.isArray(data.sprites) || !data.actions) {
+  if (data && data.version === 1 && data.source?.sheetDataUrl && Array.isArray(data.sprites)) {
+    const image = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Failed to decode legacy sheetDataUrl image."));
+      img.src = data.source.sheetDataUrl;
+    });
+    const imageData = imageToImageData(image);
+    state.characters.loadedAssetUrl = data.source.assetUrl || null;
+    state.characters.loadedSheetUrl = data.source.sheetUrl || null;
+    state.characters.loadedSheetFile = null;
+    state.characters.sheetImageData = imageData;
+    state.characters.sprites = buildSpriteRecordsFromBoxes(imageData, data.sprites).map((s) => ({
+      ...s,
+      fileName: null,
+      sourceType: "legacy",
+    }));
+    state.characters.detectStrictness = Math.max(0, Math.min(1, Number(data.detectStrictness) || 0.65));
+    state.characters.actions = normalizeActionMap(data.actions || { run: { name: "run", frames: [], backgroundColor: null } });
+    state.characters.selectedAction = data.selectedAction || Object.keys(state.characters.actions)[0] || "run";
+    renderDetectStrictnessUI();
+    updateSpriteSheetMetaText();
+    renderActionSelect();
+    renderSpritePalette();
+    renderActionTimeline();
+    startCharacterPreview();
+    return;
+  }
+
+  if (!data || !data.slug || !data.actions || !Array.isArray(data.sprites)) {
     throw new Error("Invalid character JSON format.");
   }
 
-  const image = await new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("Failed to decode sheetDataUrl image."));
-    img.src = data.source.sheetDataUrl;
-  });
+  state.characters.activeSlug = String(data.slug);
+  state.characters.activeName = String(data.name || data.slug);
+  state.characters.loadedAssetUrl = data.source?.assetUrl || null;
+  state.characters.loadedSheetUrl = data.source?.sheetUrl || null;
+  state.characters.loadedSheetFile = data.source?.sheetFile || null;
+  state.characters.sheetDataUrl = null;
+  state.characters.sheetImageData = null;
+  state.characters.selectedSpriteIds = {};
 
-  const imageData = imageToImageData(image);
-  state.characters.loadedAssetUrl = data.source.assetUrl || null;
-  state.characters.loadedSheetUrl = data.source.sheetUrl || null;
-  state.characters.sheetDataUrl = data.source.sheetDataUrl;
-  state.characters.sheetImageData = imageData;
-  state.characters.sprites = buildSpriteRecordsFromBoxes(imageData, data.sprites);
+  if (state.characters.loadedSheetFile) {
+    try {
+      const sheet = await loadImageFromUrl(`/characters/${encodeURIComponent(data.slug)}/sheets/${encodeURIComponent(state.characters.loadedSheetFile)}?t=${Date.now()}`);
+      state.characters.sheetImageData = imageToImageData(sheet);
+    } catch (_e) {
+      state.characters.sheetImageData = null;
+    }
+  }
+
+  const loadedSprites = [];
+  for (const meta of data.sprites) {
+    try {
+      const rec = await spriteRecordFromFile(data.slug, meta);
+      if (rec) loadedSprites.push(rec);
+    } catch (_e) {
+      // Skip broken sprite file but keep loading remaining sprites.
+    }
+  }
+  loadedSprites.sort((a, b) => a.id - b.id);
+  state.characters.sprites = loadedSprites;
+
   state.characters.detectStrictness = Math.max(0, Math.min(1, Number(data.detectStrictness) || 0.65));
-  state.characters.actions = data.actions;
+  state.characters.actions = normalizeActionMap(data.actions);
   state.characters.selectedAction = data.selectedAction || Object.keys(data.actions)[0] || "run";
 
   if (!state.characters.actions[state.characters.selectedAction]) {
-    state.characters.actions[state.characters.selectedAction] = { name: state.characters.selectedAction, frames: [] };
+    state.characters.actions[state.characters.selectedAction] = {
+      name: state.characters.selectedAction,
+      frames: [],
+      backgroundColor: null,
+    };
   }
 
   renderDetectStrictnessUI();
   updateSpriteSheetMetaText();
-
+  renderCharacterLibrarySelect();
   renderActionSelect();
   renderSpritePalette();
   renderActionTimeline();
   startCharacterPreview();
 }
 
-async function restoreCharacterAutosaveIfAny() {
-  const key = state.characters.autosaveStorageKey;
-  const raw = localStorage.getItem(key);
-  if (!raw) return false;
-  try {
-    const data = JSON.parse(raw);
-    await applyCharacterProjectData(data);
-    return true;
-  } catch (_err) {
-    return false;
+function renderCharacterLibrarySelect() {
+  if (!el.characterSelect) return;
+  el.characterSelect.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = state.characters.library.length ? "Select character..." : "No characters yet";
+  el.characterSelect.appendChild(placeholder);
+
+  for (const item of state.characters.library) {
+    const opt = document.createElement("option");
+    opt.value = item.slug;
+    opt.textContent = item.name;
+    el.characterSelect.appendChild(opt);
+  }
+
+  if (state.characters.activeSlug) {
+    el.characterSelect.value = state.characters.activeSlug;
   }
 }
 
+async function loadCharacterLibrary() {
+  const resp = await charactersApi("list");
+  state.characters.library = Array.isArray(resp.characters) ? resp.characters : [];
+  renderCharacterLibrarySelect();
+}
+
+async function loadCharacterBySlug(slug) {
+  const safe = String(slug || "").trim();
+  if (!safe) return;
+  const resp = await charactersApi(`${encodeURIComponent(safe)}/load`);
+  await applyCharacterProjectData(resp.character);
+  setStatus(`Character loaded: ${state.characters.activeName}`);
+}
+
+async function createCharacter(name) {
+  const resp = await charactersApi("create", {
+    method: "POST",
+    body: { name },
+  });
+  await loadCharacterLibrary();
+  await applyCharacterProjectData(resp.character);
+  setStatus(`Character created: ${resp.character.name}`);
+}
+
+async function restoreCharacterAutosaveIfAny() {
+  await loadCharacterLibrary();
+  if (!state.characters.library.length) return false;
+  const first = state.characters.library[0];
+  await loadCharacterBySlug(first.slug);
+  return true;
+}
+
 async function fetchTextViaProxy(url) {
-  const proxied = `https://r.jina.ai/http://${url.replace(/^https?:\/\//, "")}`;
-  const res = await fetch(proxied);
+  const normalized = String(url || "").trim();
+  if (!/^https?:\/\//i.test(normalized)) {
+    throw new Error("Invalid URL");
+  }
+
+  // Prefer local server proxy so we can parse raw HTML and avoid external proxy bottlenecks.
+  const localProxy = `/webproxy?url=${encodeURIComponent(normalized)}`;
+  try {
+    const localRes = await fetch(localProxy, { cache: "no-store" });
+    if (localRes.ok) {
+      return localRes.text();
+    }
+  } catch (_e) {
+    // Fall back to r.jina.ai below.
+  }
+
+  const proxied = `https://r.jina.ai/http://${normalized.replace(/^https?:\/\//, "")}`;
+  const res = await fetch(proxied, { cache: "no-store" });
   if (!res.ok) {
     throw new Error(`Proxy fetch failed (${res.status}).`);
   }
   return res.text();
+}
+
+function decodeHtmlEntities(value) {
+  return String(value || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function stripHtmlTags(value) {
+  return decodeHtmlEntities(String(value || "").replace(/<[^>]+>/g, " "))
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeAssetUrlCandidate(candidate) {
+  let value = String(candidate || "").trim();
+  if (!value) return null;
+  if (value.startsWith("//")) value = `https:${value}`;
+  if (value.startsWith("/")) value = `https://www.spriters-resource.com${value}`;
+  value = value.replace(/^http:\/\//i, "https://");
+  const match = value.match(/https?:\/\/www\.spriters-resource\.com\/[a-z0-9_\-\/]+\/asset\/\d+\/?/i);
+  if (!match) return null;
+  return match[0].replace(/^http:\/\//i, "https://").replace(/\?.*$/, "").replace(/\/?$/, "/");
+}
+
+function normalizeSpritersMediaUrl(candidate) {
+  let value = String(candidate || "").trim();
+  if (!value) return null;
+  if (value.startsWith("//")) value = `https:${value}`;
+  if (value.startsWith("/")) value = `https://www.spriters-resource.com${value}`;
+  value = value.replace(/^http:\/\//i, "https://");
+  if (!/^https?:\/\/www\.spriters-resource\.com\//i.test(value)) return null;
+  return value;
 }
 
 function extractAssetLinksFromText(text) {
@@ -4029,9 +4435,8 @@ function extractAssetLinksFromText(text) {
       }
     }
 
-    const match = value.match(/https?:\/\/www\.spriters-resource\.com\/[a-z0-9_\-\/]+\/asset\/\d+\/?/i);
-    if (!match) return;
-    const normalized = match[0].replace(/^http:\/\//i, "https://").replace(/\/?$/, "/");
+    const normalized = normalizeAssetUrlCandidate(value);
+    if (!normalized) return;
     const key = normalized.toLowerCase();
     if (seen.has(key)) return;
     seen.add(key);
@@ -4045,6 +4450,12 @@ function extractAssetLinksFromText(text) {
   for (const token of encoded) {
     const value = token.split("=").slice(1).join("=");
     addUrl(value);
+  }
+
+  const hrefRe = /href\s*=\s*"([^"]+)"/gi;
+  let hrefMatch;
+  while ((hrefMatch = hrefRe.exec(text)) !== null) {
+    addUrl(hrefMatch[1]);
   }
 
   return unique.slice(0, 30);
@@ -4083,15 +4494,97 @@ function extractBrowseResultEntries(text) {
     });
   }
 
+  const anchorRe = /<a[^>]+href="([^"]*\/asset\/\d+\/?[^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+  while ((match = anchorRe.exec(text)) !== null) {
+    const assetUrl = normalizeAssetUrlCandidate(match[1]);
+    if (!assetUrl) continue;
+    const key = assetUrl.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const inner = match[2] || "";
+    const thumbMatch = inner.match(/<img[^>]+src="([^"]+)"/i);
+    const thumbnailUrl = thumbMatch ? normalizeSpritersMediaUrl(thumbMatch[1]) : null;
+    const label = stripHtmlTags(inner) || labelFromAssetUrl(assetUrl);
+
+    entries.push({
+      assetUrl,
+      label,
+      thumbnailUrl,
+    });
+  }
+
   return entries.slice(0, 40);
+}
+
+function extractDuckDuckGoAssetEntries(text) {
+  const entries = [];
+  const seen = new Set();
+  const re = /\[([^\]]+)\]\(http:\/\/duckduckgo\.com\/l\/\?uddg=([^)&\s]+)[^)]*\)/gi;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    const title = String(match[1] || "").replace(/\s+/g, " ").trim();
+    let decoded = "";
+    try {
+      decoded = decodeURIComponent(match[2] || "");
+    } catch (_e) {
+      decoded = String(match[2] || "");
+    }
+    const m = decoded.match(/^https?:\/\/www\.spriters-resource\.com\/[a-z0-9_\-\/]+\/asset\/(\d+)\/?/i);
+    if (!m) continue;
+
+    const assetId = Number(m[1]);
+    if (!Number.isInteger(assetId) || assetId <= 0) continue;
+
+    const assetUrl = decoded.replace(/^http:\/\//i, "https://").replace(/\?.*$/, "").replace(/\/?$/, "/");
+    const key = assetUrl.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    entries.push({
+      assetUrl,
+      label: title || labelFromAssetUrl(assetUrl),
+      thumbnailUrl: `https://external-content.duckduckgo.com/ip3/www.spriters-resource.com.ico`,
+    });
+  }
+
+  const htmlRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  while ((match = htmlRe.exec(text)) !== null) {
+    const href = String(match[1] || "");
+    const label = stripHtmlTags(match[2] || "");
+
+    let candidate = href;
+    try {
+      const parsed = new URL(href, "https://duckduckgo.com");
+      const uddg = parsed.searchParams.get("uddg");
+      if (uddg) candidate = decodeURIComponent(uddg);
+    } catch (_e) {
+      // Keep original href when URL parsing fails.
+    }
+
+    const assetUrl = normalizeAssetUrlCandidate(candidate);
+    if (!assetUrl) continue;
+    const key = assetUrl.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    entries.push({
+      assetUrl,
+      label: label || labelFromAssetUrl(assetUrl),
+      thumbnailUrl: `https://external-content.duckduckgo.com/ip3/www.spriters-resource.com.ico`,
+    });
+  }
+
+  return entries;
 }
 
 function fallbackCharacterSearch(query) {
   const q = (query || "").toLowerCase();
   const catalog = [
-    { assetUrl: DEMOS.mario_anim.spritePage, label: "supermariobros asset 50365" },
-    { assetUrl: DEMOS.sonic_sms_anim.spritePage, label: "sonicthehedgehog asset 5859" },
-    { assetUrl: DEMOS.sonic_md_anim.spritePage, label: "sonicth1 asset 21628" },
+    { assetUrl: DEMOS.mario_anim.spritePage, label: "supermariobros asset 50365", thumbnailUrl: DEMOS.mario_anim.spriteUrl },
+    { assetUrl: DEMOS.sonic_sms_anim.spritePage, label: "sonicthehedgehog asset 5859", thumbnailUrl: DEMOS.sonic_sms_anim.spriteUrl },
+    { assetUrl: DEMOS.sonic_md_anim.spritePage, label: "sonicth1 asset 21628", thumbnailUrl: DEMOS.sonic_md_anim.spriteUrl },
+    { assetUrl: "https://www.spriters-resource.com/custom_edited/sonicthehedgehogcustoms/asset/12834/", label: "sonicthehedgehogcustoms asset 12834", thumbnailUrl: null },
+    { assetUrl: "https://www.spriters-resource.com/genesis_32x_scd/sonicthehedgehog/asset/12507/", label: "sonicthehedgehog asset 12507", thumbnailUrl: null },
   ];
 
   const byKeyword = catalog.filter((item) => item.label.includes(q));
@@ -4135,7 +4628,7 @@ function renderCharacterSearchResults() {
     icon.alt = `${item.label} thumbnail`;
     icon.loading = "lazy";
     icon.decoding = "async";
-    icon.src = item.thumbnailUrl || "";
+    icon.src = item.thumbnailUrl || "https://external-content.duckduckgo.com/ip3/www.spriters-resource.com.ico";
     head.appendChild(icon);
 
     const textWrap = document.createElement("div");
@@ -4184,58 +4677,106 @@ async function runCharacterSearch() {
     return;
   }
 
+  resetCharacterSearchState(query);
+  state.characters.searchResults = [];
   el.charSearchStatus.textContent = "Searching...";
   try {
-    const q = encodeURIComponent(query);
-    const browseUrls = [
-      `https://www.spriters-resource.com/browse/assets/?name=${q}`,
-      `https://www.spriters-resource.com/browse/assets/page-2/?name=${q}`,
-    ];
+    const sdbEntries = await fetchSpriteDatabaseSearchEntries(query);
+    appendCharacterSearchEntries(sdbEntries);
+    if (sdbEntries.length > 0) {
+      state.characters.searchSource = "spritedatabase";
+      state.characters.searchCanLoadMore = false;
+    }
 
-    const allLinks = [];
-    const allEntries = [];
-    for (const url of browseUrls) {
-      try {
-        const text = await fetchTextViaProxy(url);
-        allEntries.push(...extractBrowseResultEntries(text));
-        allLinks.push(...extractAssetLinksFromText(text));
-      } catch (_err) {
-        // Continue; partial page results are still useful.
+    if (state.characters.searchResults.length === 0) {
+      const firstPage = await fetchSpritersBrowsePage(query, 1);
+      state.characters.searchBrowseNextPage = 2;
+      state.characters.searchCanLoadMore = firstPage.added > 0 && !firstPage.blocked;
+      if (firstPage.added > 0) {
+        state.characters.searchSource = "spriters";
+      }
+
+      if (firstPage.blocked && state.characters.searchResults.length > 0) {
+        el.charSearchStatus.textContent = `${state.characters.searchResults.length} result(s). Spriters browse is challenge-protected right now; showing fallback source results.`;
       }
     }
 
-    const seen = new Set();
-    const resultsFromEntries = [];
-    for (const item of allEntries) {
-      const key = item.assetUrl.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      resultsFromEntries.push(item);
+    if (state.characters.searchResults.length < 10) {
+      const added = await fetchDuckDuckGoSearchBatch(query, 0, 8);
+      if (added > 0 && !state.characters.searchSource) {
+        state.characters.searchSource = "duckduckgo";
+      }
+      state.characters.searchCanLoadMore = state.characters.searchCanLoadMore || added > 0;
     }
 
-    for (const link of allLinks) {
-      const key = link.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      resultsFromEntries.push({ assetUrl: link, label: labelFromAssetUrl(link), thumbnailUrl: null });
+    if (state.characters.searchResults.length === 0) {
+      appendCharacterSearchEntries(fallbackCharacterSearch(query));
+      state.characters.searchSource = "fallback";
+      state.characters.searchCanLoadMore = false;
     }
 
-    let results = resultsFromEntries;
-    if (results.length === 0) {
-      results = fallbackCharacterSearch(query);
+    if (state.characters.searchSource === "spritedatabase") {
+      el.charSearchStatus.textContent = `${state.characters.searchResults.length} result(s) from Sprite Database.`;
+    } else {
+      el.charSearchStatus.textContent = `${state.characters.searchResults.length} result(s).`;
     }
-
-    state.characters.searchResults = results;
-    el.charSearchStatus.textContent = `${state.characters.searchResults.length} result(s).`;
     renderCharacterSearchResults();
+    updateGeneralButtonStates();
   } catch (err) {
-    state.characters.searchResults = fallbackCharacterSearch(query);
+    resetCharacterSearchState(query);
+    state.characters.searchResults = [];
+    appendCharacterSearchEntries(fallbackCharacterSearch(query));
     if (state.characters.searchResults.length) {
       el.charSearchStatus.textContent = `Search network failed (${err.message}). Showing local known results.`;
       renderCharacterSearchResults();
+      updateGeneralButtonStates();
       return;
     }
     el.charSearchStatus.textContent = `Search failed: ${err.message}`;
+    updateGeneralButtonStates();
+  }
+}
+
+async function loadMoreCharacterSearchResults() {
+  const query = (state.characters.searchQuery || "").trim();
+  if (!query || state.characters.searchLoadingMore) return;
+  if (state.characters.searchSource === "spritedatabase") {
+    state.characters.searchCanLoadMore = false;
+    el.charSearchStatus.textContent = `${state.characters.searchResults.length} result(s) from Sprite Database.`;
+    updateGeneralButtonStates();
+    return;
+  }
+  state.characters.searchLoadingMore = true;
+  updateGeneralButtonStates();
+
+  try {
+    let added = 0;
+    let blocked = false;
+
+    const page = state.characters.searchBrowseNextPage;
+    if (page >= 2) {
+      const browse = await fetchSpritersBrowsePage(query, page);
+      added += browse.added;
+      blocked = browse.blocked;
+      if (!blocked) state.characters.searchBrowseNextPage = page + 1;
+    }
+
+    if (added < 5) {
+      added += await fetchDuckDuckGoSearchBatch(query, state.characters.searchFallbackNextOffset, 8);
+    }
+
+    state.characters.searchCanLoadMore = added > 0 || (state.characters.searchBrowseNextPage >= 2 && !blocked);
+    if (added === 0 && !blocked) {
+      state.characters.searchCanLoadMore = false;
+    }
+    el.charSearchStatus.textContent = `${state.characters.searchResults.length} result(s).`;
+    renderCharacterSearchResults();
+  } catch (err) {
+    state.characters.searchCanLoadMore = false;
+    el.charSearchStatus.textContent = `Load more failed: ${err.message}`;
+  } finally {
+    state.characters.searchLoadingMore = false;
+    updateGeneralButtonStates();
   }
 }
 
@@ -4255,16 +4796,51 @@ function parseSheetDownloadUrl(assetPageText) {
     /\[download\]\((https?:\/\/www\.spriters-resource\.com\/media\/assets\/[^)\s]+\.(?:png|gif|webp|jpg|jpeg)(?:\?[^)\s]*)?)\)/gi,
     /!\[[^\]]*\]\((https?:\/\/www\.spriters-resource\.com\/media\/assets\/[^)\s]+\.(?:png|gif|webp|jpg|jpeg)(?:\?[^)\s]*)?)\)/gi,
     /https?:\/\/www\.spriters-resource\.com\/media\/assets\/[^\s"')]+\.(?:png|gif|webp|jpg|jpeg)(?:\?[^\s"')]*)?/gi,
+    /href=['"](files\/[a-z0-9_\-\/]+\.(?:png|gif|webp|jpg|jpeg)(?:\?[^'"\s]*)?)['"]/gi,
+    /src=['"](files\/[a-z0-9_\-\/]+\.(?:png|gif|webp|jpg|jpeg)(?:\?[^'"\s]*)?)['"]/gi,
   ];
 
   for (const pattern of patterns) {
     let match;
     while ((match = pattern.exec(assetPageText)) !== null) {
-      add(match[1] || match[0]);
+      const raw = match[1] || match[0];
+      if (/^files\//i.test(raw)) {
+        add(`https://spritedatabase.net/${raw.replace(/^\/+/, "")}`);
+      } else {
+        add(raw);
+      }
     }
   }
 
   return candidates[0] || null;
+}
+
+function parseAssetIdFromUrl(assetUrl) {
+  const m = String(assetUrl || "").match(/\/asset\/(\d+)\/?/i);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function buildSheetUrlFallbackCandidates(assetUrl) {
+  const out = [];
+  const add = (u) => {
+    const key = String(u || "").trim();
+    if (!key) return;
+    if (!out.includes(key)) out.push(key);
+  };
+
+  const id = parseAssetIdFromUrl(assetUrl);
+  if (id) {
+    add(`https://www.spriters-resource.com/download/${id}/`);
+    add(`https://www.spriters-resource.com/resources/sheets/${id}.png`);
+  }
+
+  if (assetUrl === DEMOS.mario_anim.spritePage) add(DEMOS.mario_anim.spriteUrl);
+  if (assetUrl === DEMOS.sonic_sms_anim.spritePage) add(DEMOS.sonic_sms_anim.spriteUrl);
+  if (assetUrl === DEMOS.sonic_md_anim.spritePage) add(DEMOS.sonic_md_anim.spriteUrl);
+
+  return out;
 }
 
 function buildSpriteRecordsFromBoxes(imageData, boxes) {
@@ -4317,6 +4893,88 @@ function renderDetectStrictnessUI() {
   updateGeneralButtonStates();
 }
 
+function setDetectModalStatus(message) {
+  if (el.detectModalStatus) el.detectModalStatus.textContent = message;
+}
+
+function renderDetectModalCandidates() {
+  if (!el.detectModalGrid) return;
+  const modal = state.characters.detectModal;
+  el.detectModalGrid.innerHTML = "";
+
+  if (!modal.candidates.length) {
+    const empty = document.createElement("div");
+    empty.className = "hint";
+    empty.textContent = "No sprites detected with this strictness.";
+    el.detectModalGrid.appendChild(empty);
+    return;
+  }
+
+  for (let i = 0; i < modal.candidates.length; i += 1) {
+    const sprite = modal.candidates[i];
+    const chip = document.createElement("div");
+    chip.className = "detect-candidate-chip";
+    const selected = Boolean(modal.selected[i]);
+    if (selected) chip.classList.add("selected");
+
+    const head = document.createElement("div");
+    head.className = "detect-candidate-head";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = selected;
+    checkbox.addEventListener("click", (event) => event.stopPropagation());
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) modal.selected[i] = true;
+      else delete modal.selected[i];
+      renderDetectModalCandidates();
+    });
+    head.appendChild(checkbox);
+    chip.appendChild(head);
+
+    chip.addEventListener("click", () => {
+      if (modal.selected[i]) delete modal.selected[i];
+      else modal.selected[i] = true;
+      renderDetectModalCandidates();
+    });
+
+    const canvas = document.createElement("canvas");
+    renderSpriteThumb(sprite, canvas);
+    chip.appendChild(canvas);
+
+    const meta = document.createElement("div");
+    meta.textContent = `${sprite.w}x${sprite.h}`;
+    chip.appendChild(meta);
+
+    el.detectModalGrid.appendChild(chip);
+  }
+}
+
+function openDetectModal() {
+  if (!el.detectModal) return;
+  el.detectModal.hidden = false;
+  state.characters.detectModal.open = true;
+}
+
+function closeDetectModal() {
+  if (!el.detectModal) return;
+  el.detectModal.hidden = true;
+  state.characters.detectModal.open = false;
+}
+
+async function openDetectModalForImage(image, meta = {}) {
+  const imageData = imageToImageData(image);
+  const detected = autoDetectCharacterSprites(imageData, state.characters.detectStrictness);
+  state.characters.detectModal.imageData = imageData;
+  state.characters.detectModal.sourceMeta = { ...meta, image };
+  state.characters.detectModal.candidates = detected;
+  state.characters.detectModal.selected = {};
+  for (let i = 0; i < detected.length; i += 1) state.characters.detectModal.selected[i] = true;
+  renderDetectStrictnessUI();
+  renderDetectModalCandidates();
+  setDetectModalStatus(`Detected ${detected.length} sprites. Select what to import.`);
+  openDetectModal();
+}
+
 function updateSpriteSheetMetaText() {
   const imageData = state.characters.sheetImageData;
   if (!imageData) {
@@ -4332,8 +4990,8 @@ function updateSpriteSheetMetaText() {
     `sheet url: ${state.characters.loadedSheetUrl || "local file"}`;
 }
 
-function runCharacterDetection(strictness = state.characters.detectStrictness) {
-  const imageData = state.characters.sheetImageData;
+async function runCharacterDetection(strictness = state.characters.detectStrictness) {
+  const imageData = state.characters.detectModal.imageData;
   if (!imageData) {
     throw new Error("No sheet loaded.");
   }
@@ -4341,19 +4999,17 @@ function runCharacterDetection(strictness = state.characters.detectStrictness) {
   const s = Math.max(0, Math.min(1, Number(strictness) || 0));
   state.characters.detectStrictness = s;
   const detected = autoDetectCharacterSprites(imageData, s);
-  state.characters.sprites = detected;
-
+  state.characters.detectModal.candidates = detected;
+  state.characters.detectModal.selected = {};
+  for (let i = 0; i < detected.length; i += 1) state.characters.detectModal.selected[i] = true;
   renderDetectStrictnessUI();
-  updateSpriteSheetMetaText();
-  renderSpritePalette();
-  renderActionTimeline();
-  startCharacterPreview();
-  scheduleCharacterAutosave();
+  renderDetectModalCandidates();
+  setDetectModalStatus(`Detected ${detected.length} sprites at strictness ${s.toFixed(2)}.`);
   return detected;
 }
 
-function runDetectStrictnessSweep() {
-  const imageData = state.characters.sheetImageData;
+async function runDetectStrictnessSweep() {
+  const imageData = state.characters.detectModal.imageData;
   if (!imageData) {
     throw new Error("No sheet loaded.");
   }
@@ -4371,18 +5027,40 @@ function runDetectStrictnessSweep() {
   }
 
   state.characters.detectStrictness = best.strictness;
-  state.characters.sprites = best.detected;
+  state.characters.detectModal.candidates = best.detected;
+  state.characters.detectModal.selected = {};
+  for (let i = 0; i < best.detected.length; i += 1) state.characters.detectModal.selected[i] = true;
   renderDetectStrictnessUI();
+  renderDetectModalCandidates();
+  setDetectModalStatus(`Best of 20 strictness runs: ${best.strictness.toFixed(2)} with ${best.score} sprites.`);
+
+  return best;
+}
+
+async function importDetectedSpritesByIndex(indexes) {
+  const modal = state.characters.detectModal;
+  if (!modal.imageData || !modal.sourceMeta?.image) {
+    throw new Error("No sheet loaded for import.");
+  }
+  const selected = indexes
+    .map((idx) => modal.candidates[idx])
+    .filter(Boolean);
+  if (!selected.length) {
+    throw new Error("No sprites selected.");
+  }
+
+  state.characters.sheetImageData = modal.imageData;
+  await saveSheetForActiveCharacter(modal.sourceMeta.image, {
+    assetUrl: modal.sourceMeta.assetUrl || null,
+    sheetUrl: modal.sourceMeta.sheetUrl || null,
+  });
+  await saveDetectedSpritesForActiveCharacter(selected);
   updateSpriteSheetMetaText();
   renderSpritePalette();
   renderActionTimeline();
   startCharacterPreview();
   scheduleCharacterAutosave();
-
-  el.detectSummary.textContent =
-    `Best of 20 strictness runs: ${best.strictness.toFixed(2)} with ${best.score} sprites.`;
-
-  return best;
+  el.detectSummary.textContent = `Imported ${selected.length} sprite(s).`;
 }
 
 function renderSpriteThumb(sprite, canvas) {
@@ -4410,10 +5088,37 @@ function renderSpritePalette() {
   for (const sprite of state.characters.sprites) {
     const chip = document.createElement("div");
     chip.className = "sprite-chip";
+    const isSelected = Boolean(state.characters.selectedSpriteIds[sprite.id]);
+    if (isSelected) chip.classList.add("selected");
     chip.draggable = true;
     chip.addEventListener("dragstart", (event) => {
       event.dataTransfer.setData("text/sprite-id", String(sprite.id));
       event.dataTransfer.effectAllowed = "copy";
+    });
+
+    const head = document.createElement("div");
+    head.className = "sprite-chip-head";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = isSelected;
+    checkbox.addEventListener("click", (event) => {
+      event.stopPropagation();
+    });
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) state.characters.selectedSpriteIds[sprite.id] = true;
+      else delete state.characters.selectedSpriteIds[sprite.id];
+      renderSpritePalette();
+      updateGeneralButtonStates();
+    });
+    head.appendChild(checkbox);
+    chip.appendChild(head);
+
+    chip.addEventListener("click", () => {
+      const next = !Boolean(state.characters.selectedSpriteIds[sprite.id]);
+      if (next) state.characters.selectedSpriteIds[sprite.id] = true;
+      else delete state.characters.selectedSpriteIds[sprite.id];
+      renderSpritePalette();
+      updateGeneralButtonStates();
     });
 
     const canvas = document.createElement("canvas");
@@ -4424,8 +5129,48 @@ function renderSpritePalette() {
     meta.textContent = `#${sprite.id} ${sprite.w}x${sprite.h}`;
     chip.appendChild(meta);
 
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "danger";
+    del.textContent = "Delete";
+    del.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      await deleteSpritesByIds([sprite.id]);
+    });
+    chip.appendChild(del);
+
     el.spritePalette.appendChild(chip);
   }
+  updateGeneralButtonStates();
+}
+
+async function deleteSpritesByIds(ids) {
+  const list = Array.from(new Set((ids || []).map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0)));
+  if (!list.length || !state.characters.activeSlug) return;
+
+  const fileNames = state.characters.sprites
+    .filter((s) => list.includes(s.id) && s.fileName)
+    .map((s) => s.fileName);
+
+  if (!fileNames.length) return;
+
+  await charactersApi(`${encodeURIComponent(state.characters.activeSlug)}/sprites-delete`, {
+    method: "POST",
+    body: { fileNames },
+  });
+
+  state.characters.sprites = state.characters.sprites.filter((s) => !list.includes(s.id));
+  for (const id of list) delete state.characters.selectedSpriteIds[id];
+
+  for (const action of Object.values(state.characters.actions || {})) {
+    if (!action || !Array.isArray(action.frames)) continue;
+    action.frames = action.frames.filter((f) => !list.includes(Number(f.spriteId)));
+  }
+
+  renderSpritePalette();
+  renderActionTimeline();
+  startCharacterPreview();
+  scheduleCharacterAutosave();
 }
 
 function getSelectedAction() {
@@ -4436,7 +5181,7 @@ function ensureAction(name) {
   const key = (name || "").trim().toLowerCase().replace(/[^a-z0-9_\-]+/g, "_");
   if (!key) return null;
   if (!state.characters.actions[key]) {
-    state.characters.actions[key] = { name: key, frames: [] };
+    state.characters.actions[key] = { name: key, frames: [], backgroundColor: null };
   }
   state.characters.selectedAction = key;
   return state.characters.actions[key];
@@ -4462,6 +5207,13 @@ function renderActionSelect() {
 function addFrameToSelectedAction(spriteId) {
   const action = getSelectedAction();
   if (!action) return;
+  const sprite = state.characters.sprites.find((s) => s.id === spriteId) || null;
+  if (action.frames.length === 0 && !action.backgroundColor && sprite && sprite.data?.length >= 4) {
+    const r = sprite.data[0];
+    const g = sprite.data[1];
+    const b = sprite.data[2];
+    action.backgroundColor = rgbToHex(r, g, b);
+  }
   action.frames.push({ spriteId, durationMs: 120, offsetX: 0, offsetY: 0, offsetZ: 0 });
   renderActionTimeline();
   scheduleCharacterAutosave();
@@ -4532,6 +5284,29 @@ function renderPreviewInfo(text) {
   el.previewInfo.textContent = text;
 }
 
+function rgbToHex(r, g, b) {
+  const toHex = (n) => Math.max(0, Math.min(255, Number(n) || 0)).toString(16).padStart(2, "0");
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+function parseHexRgb(hex) {
+  const [r, g, b] = parseHexColor(hex);
+  return [r, g, b];
+}
+
+function applyBackgroundColorMask(sprite, backgroundColorHex) {
+  if (!sprite || !backgroundColorHex) return new ImageData(new Uint8ClampedArray(sprite.data), sprite.w, sprite.h);
+  const [br, bg, bb] = parseHexRgb(backgroundColorHex);
+  const next = new Uint8ClampedArray(sprite.data);
+  for (let i = 0; i < next.length; i += 4) {
+    if (next[i + 3] === 0) continue;
+    if (next[i] === br && next[i + 1] === bg && next[i + 2] === bb) {
+      next[i + 3] = 0;
+    }
+  }
+  return new ImageData(next, sprite.w, sprite.h);
+}
+
 function drawCharacterPreview(now) {
   const c = state.characters;
   const canvas = el.charPreviewCanvas;
@@ -4565,7 +5340,8 @@ function drawCharacterPreview(now) {
     const src = document.createElement("canvas");
     src.width = sprite.w;
     src.height = sprite.h;
-    src.getContext("2d").putImageData(new ImageData(sprite.data, sprite.w, sprite.h), 0, 0);
+    const masked = applyBackgroundColorMask(sprite, action.backgroundColor || null);
+    src.getContext("2d").putImageData(masked, 0, 0);
 
     const scale = 3;
     const drawW = sprite.w * scale;
@@ -4579,7 +5355,8 @@ function drawCharacterPreview(now) {
     renderPreviewInfo(
       `action: ${c.selectedAction}\nframe: ${c.previewFrameIndex + 1}/${action.frames.length}\n` +
       `sprite: #${sprite.id} ${sprite.w}x${sprite.h}\n` +
-      `offset: x=${current.offsetX}, y=${current.offsetY}, z=${current.offsetZ}`
+      `offset: x=${current.offsetX}, y=${current.offsetY}, z=${current.offsetZ}\n` +
+      `bg: ${action.backgroundColor || "none"}`
     );
   }
 
@@ -4595,44 +5372,348 @@ function startCharacterPreview() {
   c.previewRafId = requestAnimationFrame(drawCharacterPreview);
 }
 
-async function loadSheetFromImage(image, meta = {}) {
-  const imageData = imageToImageData(image);
-  const detected = autoDetectCharacterSprites(imageData, state.characters.detectStrictness);
+function setSpriteEditorStatus(message) {
+  if (el.spriteEditorStatus) el.spriteEditorStatus.textContent = message;
+}
 
+function createBlankSpriteImageData(width, height) {
+  const arr = new Uint8ClampedArray(width * height * 4);
+  return new ImageData(arr, width, height);
+}
+
+function ensureSpriteEditorImageData() {
+  const ed = state.characters.editor;
+  if (!ed.imageData || ed.imageData.width !== ed.width || ed.imageData.height !== ed.height) {
+    ed.imageData = createBlankSpriteImageData(ed.width, ed.height);
+  }
+}
+
+function parseHexColor(hex) {
+  const clean = String(hex || "#ffffff").replace("#", "");
+  const value = clean.length === 3
+    ? clean.split("").map((c) => c + c).join("")
+    : clean;
+  const n = parseInt(value, 16);
+  if (!Number.isFinite(n)) return [255, 255, 255, 255];
+  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff, 255];
+}
+
+function spriteEditorPushUndoState() {
+  const ed = state.characters.editor;
+  ensureSpriteEditorImageData();
+  ed.undoStack.push(new Uint8ClampedArray(ed.imageData.data));
+  if (ed.undoStack.length > 80) ed.undoStack.shift();
+  ed.redoStack = [];
+}
+
+function renderSpriteEditorCanvas() {
+  const canvas = el.spriteEditorCanvas;
+  if (!canvas) return;
+  const ed = state.characters.editor;
+  ensureSpriteEditorImageData();
+
+  canvas.width = ed.width * ed.zoom;
+  canvas.height = ed.height * ed.zoom;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+
+  const src = document.createElement("canvas");
+  src.width = ed.width;
+  src.height = ed.height;
+  src.getContext("2d").putImageData(ed.imageData, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(src, 0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = "rgba(255,255,255,0.12)";
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= ed.width; x += 1) {
+    const px = x * ed.zoom + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, canvas.height);
+    ctx.stroke();
+  }
+  for (let y = 0; y <= ed.height; y += 1) {
+    const py = y * ed.zoom + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0, py);
+    ctx.lineTo(canvas.width, py);
+    ctx.stroke();
+  }
+}
+
+function drawOnSpriteEditor(clientX, clientY, erase = false) {
+  const canvas = el.spriteEditorCanvas;
+  if (!canvas) return;
+  const ed = state.characters.editor;
+  ensureSpriteEditorImageData();
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = rect.width > 0 ? (canvas.width / rect.width) : 1;
+  const scaleY = rect.height > 0 ? (canvas.height / rect.height) : 1;
+  const localX = (clientX - rect.left) * scaleX;
+  const localY = (clientY - rect.top) * scaleY;
+  const px = Math.floor(localX / ed.zoom);
+  const py = Math.floor(localY / ed.zoom);
+  if (px < 0 || py < 0 || px >= ed.width || py >= ed.height) return;
+
+  const [r, g, b, a] = erase ? [0, 0, 0, 0] : parseHexColor(ed.color);
+  const radius = Math.max(0, Math.floor((Math.max(1, ed.brushSize) - 1) / 2));
+  for (let y = py - radius; y <= py + radius; y += 1) {
+    for (let x = px - radius; x <= px + radius; x += 1) {
+      if (x < 0 || y < 0 || x >= ed.width || y >= ed.height) continue;
+      const idx = (y * ed.width + x) * 4;
+      ed.imageData.data[idx] = r;
+      ed.imageData.data[idx + 1] = g;
+      ed.imageData.data[idx + 2] = b;
+      ed.imageData.data[idx + 3] = a;
+    }
+  }
+  renderSpriteEditorCanvas();
+}
+
+function getSpriteEditorPixelFromClient(clientX, clientY) {
+  const canvas = el.spriteEditorCanvas;
+  if (!canvas) return null;
+  const ed = state.characters.editor;
+  ensureSpriteEditorImageData();
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = rect.width > 0 ? (canvas.width / rect.width) : 1;
+  const scaleY = rect.height > 0 ? (canvas.height / rect.height) : 1;
+  const localX = (clientX - rect.left) * scaleX;
+  const localY = (clientY - rect.top) * scaleY;
+  const px = Math.floor(localX / ed.zoom);
+  const py = Math.floor(localY / ed.zoom);
+  if (px < 0 || py < 0 || px >= ed.width || py >= ed.height) return null;
+  const idx = (py * ed.width + px) * 4;
+  return {
+    px,
+    py,
+    r: ed.imageData.data[idx],
+    g: ed.imageData.data[idx + 1],
+    b: ed.imageData.data[idx + 2],
+    a: ed.imageData.data[idx + 3],
+  };
+}
+
+function pickActionBackgroundColorFromEditor(clientX, clientY) {
+  const action = getSelectedAction();
+  if (!action) {
+    setSpriteEditorStatus("Select an action first.");
+    state.characters.editor.pickBackgroundMode = false;
+    updateGeneralButtonStates();
+    return;
+  }
+
+  const pixel = getSpriteEditorPixelFromClient(clientX, clientY);
+  if (!pixel) return;
+  action.backgroundColor = rgbToHex(pixel.r, pixel.g, pixel.b);
+  state.characters.editor.pickBackgroundMode = false;
+  setSpriteEditorStatus(
+    `Background for action '${state.characters.selectedAction}' set to ${action.backgroundColor} from pixel (${pixel.px}, ${pixel.py}).`
+  );
+  renderActionTimeline();
+  startCharacterPreview();
+  scheduleCharacterAutosave();
+  updateGeneralButtonStates();
+}
+
+function resetSpriteEditor(width, height) {
+  const ed = state.characters.editor;
+  ed.width = Math.max(1, Math.min(256, Number(width) || 16));
+  ed.height = Math.max(1, Math.min(256, Number(height) || 16));
+  ed.imageData = createBlankSpriteImageData(ed.width, ed.height);
+  ed.undoStack = [];
+  ed.redoStack = [];
+  ed.currentSpriteFileName = "";
+  renderSpriteEditorCanvas();
+}
+
+function applyImageToSpriteEditor(imageData, fileName = "") {
+  const ed = state.characters.editor;
+  ed.width = imageData.width;
+  ed.height = imageData.height;
+  ed.imageData = new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
+  ed.undoStack = [];
+  ed.redoStack = [];
+  ed.currentSpriteFileName = fileName;
+  if (el.spriteEditorName && fileName) {
+    el.spriteEditorName.value = fileName.replace(/\.[^.]+$/, "");
+  }
+  renderSpriteEditorCanvas();
+}
+
+function spriteEditorToDataUrl() {
+  const ed = state.characters.editor;
+  ensureSpriteEditorImageData();
+  const canvas = document.createElement("canvas");
+  canvas.width = ed.width;
+  canvas.height = ed.height;
+  const ctx = canvas.getContext("2d");
+  ctx.putImageData(ed.imageData, 0, 0);
+  return canvas.toDataURL("image/png");
+}
+
+async function saveSpriteEditorImage(overwrite = false) {
+  if (!state.characters.activeSlug) throw new Error("Select a character first.");
+  const ed = state.characters.editor;
+  const typed = (el.spriteEditorName?.value || "").trim();
+  const base = typed || "custom_sprite";
+  const cleaned = base.toLowerCase().replace(/[^a-z0-9_\-]+/g, "_");
+  const fallbackFile = `${cleaned || "custom_sprite"}.png`;
+  const fileName = overwrite && ed.currentSpriteFileName
+    ? ed.currentSpriteFileName
+    : `${cleaned || "custom_sprite"}_${Date.now()}.png`;
+
+  const resp = await charactersApi(`${encodeURIComponent(state.characters.activeSlug)}/sprite`, {
+    method: "POST",
+    body: {
+      fileName: overwrite ? fileName : fallbackFile === fileName ? fileName : fileName,
+      dataUrl: spriteEditorToDataUrl(),
+      meta: {
+        sourceType: "custom",
+        w: ed.width,
+        h: ed.height,
+      },
+    },
+  });
+
+  const saved = resp.sprite;
+  const existingIdx = state.characters.sprites.findIndex((s) => s.id === Number(saved.spriteId));
+  const spriteRecord = {
+    id: Number(saved.spriteId),
+    fileName: saved.fileName,
+    sourceType: "custom",
+    x: null,
+    y: null,
+    w: ed.width,
+    h: ed.height,
+    data: new Uint8ClampedArray(ed.imageData.data),
+  };
+  if (existingIdx >= 0) state.characters.sprites[existingIdx] = spriteRecord;
+  else state.characters.sprites.push(spriteRecord);
+  state.characters.sprites.sort((a, b) => a.id - b.id);
+  ed.currentSpriteFileName = saved.fileName;
+  renderSpritePalette();
+  scheduleCharacterAutosave();
+  setSpriteEditorStatus(`Saved ${saved.fileName}`);
+}
+
+function spriteRecordToPngDataUrl(sprite) {
+  const canvas = document.createElement("canvas");
+  canvas.width = sprite.w;
+  canvas.height = sprite.h;
+  const ctx = canvas.getContext("2d");
+  ctx.putImageData(new ImageData(sprite.data, sprite.w, sprite.h), 0, 0);
+  return canvas.toDataURL("image/png");
+}
+
+function imageToPngDataUrl(image) {
   const canvas = document.createElement("canvas");
   canvas.width = image.width;
   canvas.height = image.height;
   const ctx = canvas.getContext("2d");
   ctx.drawImage(image, 0, 0);
+  return canvas.toDataURL("image/png");
+}
 
+async function saveSheetForActiveCharacter(image, meta = {}) {
+  if (!state.characters.activeSlug) {
+    throw new Error("Create or select a character first.");
+  }
+  const fileName = `sheet_${Date.now()}.png`;
+  await charactersApi(`${encodeURIComponent(state.characters.activeSlug)}/sheet`, {
+    method: "POST",
+    body: {
+      fileName,
+      dataUrl: imageToPngDataUrl(image),
+      assetUrl: meta.assetUrl || null,
+      sheetUrl: meta.sheetUrl || null,
+    },
+  });
+  state.characters.loadedSheetFile = fileName;
   state.characters.loadedAssetUrl = meta.assetUrl || null;
   state.characters.loadedSheetUrl = meta.sheetUrl || null;
-  state.characters.sheetDataUrl = canvas.toDataURL("image/png");
-  state.characters.sheetImageData = imageData;
-  state.characters.sprites = detected;
+}
 
-  updateSpriteSheetMetaText();
-  el.detectSummary.textContent = `Detected ${detected.length} sprites at strictness ${state.characters.detectStrictness.toFixed(2)}.`;
+async function saveDetectedSpritesForActiveCharacter(detectedSprites) {
+  if (!state.characters.activeSlug) {
+    throw new Error("Create or select a character first.");
+  }
+  const uploaded = [];
+  let cursor = 1;
+  for (const sprite of detectedSprites) {
+    const fileName = `sprite_${String(Date.now())}_${String(cursor).padStart(4, "0")}.png`;
+    cursor += 1;
+    const resp = await charactersApi(`${encodeURIComponent(state.characters.activeSlug)}/sprite`, {
+      method: "POST",
+      body: {
+        fileName,
+        dataUrl: spriteRecordToPngDataUrl(sprite),
+        meta: {
+          sourceType: "detected",
+          x: Number.isFinite(sprite.x) ? sprite.x : null,
+          y: Number.isFinite(sprite.y) ? sprite.y : null,
+          w: sprite.w,
+          h: sprite.h,
+        },
+      },
+    });
+    uploaded.push({
+      ...sprite,
+      id: Number(resp.sprite?.spriteId || sprite.id),
+      fileName,
+      sourceType: "detected",
+    });
+  }
+  const byId = new Map(state.characters.sprites.map((s) => [s.id, s]));
+  for (const rec of uploaded) {
+    byId.set(rec.id, rec);
+  }
+  state.characters.sprites = Array.from(byId.values()).sort((a, b) => a.id - b.id);
+}
 
-  renderSpritePalette();
-  renderActionTimeline();
-  startCharacterPreview();
-  scheduleCharacterAutosave();
+async function loadSheetFromImage(image, meta = {}) {
+  if (!state.characters.activeSlug) {
+    throw new Error("Create or select a character first.");
+  }
+  await openDetectModalForImage(image, meta);
+  el.detectSummary.textContent = "Detection modal opened. Select sprites to import.";
 }
 
 async function loadSheetFromAssetUrl(assetUrl) {
   el.charSearchStatus.textContent = "Loading asset page...";
   try {
-    const pageText = await fetchTextViaProxy(assetUrl);
-    const sheetUrl = parseSheetDownloadUrl(pageText);
+    let sheetUrl = null;
+
+    try {
+      const pageText = await fetchTextViaProxy(assetUrl);
+      sheetUrl = parseSheetDownloadUrl(pageText);
+    } catch (_e) {
+      sheetUrl = null;
+    }
+
+    if (!sheetUrl) {
+      const candidates = buildSheetUrlFallbackCandidates(assetUrl);
+      for (const candidate of candidates) {
+        try {
+          // Validate candidate before using it.
+          await loadImageFromUrl(candidate);
+          sheetUrl = candidate;
+          break;
+        } catch (_err) {
+          // Try next candidate.
+        }
+      }
+    }
+
     if (!sheetUrl) {
       throw new Error("Could not find downloadable sprite image on asset page.");
     }
 
     el.charSearchStatus.textContent = "Loading sprite sheet image...";
     const image = await loadImageFromUrl(sheetUrl);
-    await loadSheetFromImage(image, { assetUrl, sheetUrl });
-    el.charSearchStatus.textContent = "Sheet loaded and sprites detected.";
+    await openDetectModalForImage(image, { assetUrl, sheetUrl });
+    el.charSearchStatus.textContent = "Sheet loaded. Select sprites in the detection modal.";
   } catch (err) {
     el.charSearchStatus.textContent = `Could not auto-load sheet: ${err.message}. Use Load Sheet File.`;
   }
@@ -5068,6 +6149,40 @@ function bindEvents() {
   });
 
   el.btnCharSearch.addEventListener("click", runCharacterSearch);
+  if (el.btnCharSearchMore) {
+    el.btnCharSearchMore.addEventListener("click", async () => {
+      await loadMoreCharacterSearchResults();
+    });
+  }
+  if (el.btnCharacterNew) {
+    el.btnCharacterNew.addEventListener("click", async () => {
+      const name = window.prompt("New character name:", "");
+      if (name == null) return;
+      const trimmed = name.trim();
+      if (!trimmed) {
+        setStatus("Character name is required.");
+        return;
+      }
+      try {
+        await createCharacter(trimmed);
+        renderCharacterLibrarySelect();
+        updateGeneralButtonStates();
+      } catch (err) {
+        setStatus(`Character create failed: ${err.message}`);
+      }
+    });
+  }
+  if (el.characterSelect) {
+    el.characterSelect.addEventListener("change", async () => {
+      const slug = el.characterSelect.value;
+      if (!slug) return;
+      try {
+        await loadCharacterBySlug(slug);
+      } catch (err) {
+        setStatus(`Character load failed: ${err.message}`);
+      }
+    });
+  }
   el.charSearchInput.addEventListener("input", updateGeneralButtonStates);
   el.charSearchInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -5107,9 +6222,9 @@ function bindEvents() {
     renderDetectStrictnessUI();
   });
 
-  el.btnDetectNow.addEventListener("click", () => {
+  el.btnDetectNow.addEventListener("click", async () => {
     try {
-      const detected = runCharacterDetection();
+      const detected = await runCharacterDetection();
       el.detectSummary.textContent =
         `Detected ${detected.length} sprites at strictness ${state.characters.detectStrictness.toFixed(2)}.`;
     } catch (err) {
@@ -5117,13 +6232,102 @@ function bindEvents() {
     }
   });
 
-  el.btnDetectSweep.addEventListener("click", () => {
+  el.btnDetectSweep.addEventListener("click", async () => {
     try {
-      runDetectStrictnessSweep();
+      await runDetectStrictnessSweep();
     } catch (err) {
       el.detectSummary.textContent = `Sweep failed: ${err.message}`;
     }
   });
+
+  if (el.btnDetectImportSelected) {
+    el.btnDetectImportSelected.addEventListener("click", async () => {
+      const idx = Object.keys(state.characters.detectModal.selected || {})
+        .filter((k) => state.characters.detectModal.selected[k])
+        .map((k) => Number(k));
+      try {
+        await importDetectedSpritesByIndex(idx);
+        closeDetectModal();
+      } catch (err) {
+        setDetectModalStatus(`Import failed: ${err.message}`);
+      }
+    });
+  }
+
+  if (el.btnDetectAddAll) {
+    el.btnDetectAddAll.addEventListener("click", async () => {
+      const all = state.characters.detectModal.candidates.map((_, i) => i);
+      try {
+        await importDetectedSpritesByIndex(all);
+        closeDetectModal();
+      } catch (err) {
+        setDetectModalStatus(`Import failed: ${err.message}`);
+      }
+    });
+  }
+
+  if (el.btnDetectSelectAll) {
+    el.btnDetectSelectAll.addEventListener("click", () => {
+      const modal = state.characters.detectModal;
+      modal.selected = {};
+      for (let i = 0; i < modal.candidates.length; i += 1) {
+        modal.selected[i] = true;
+      }
+      renderDetectModalCandidates();
+      setDetectModalStatus(`Selected ${modal.candidates.length} sprite(s).`);
+    });
+  }
+
+  if (el.btnDetectSelectNone) {
+    el.btnDetectSelectNone.addEventListener("click", () => {
+      state.characters.detectModal.selected = {};
+      renderDetectModalCandidates();
+      setDetectModalStatus("Selection cleared.");
+    });
+  }
+
+  if (el.btnDetectClose) {
+    el.btnDetectClose.addEventListener("click", () => {
+      closeDetectModal();
+    });
+  }
+
+  if (el.detectModal) {
+    el.detectModal.addEventListener("click", (event) => {
+      if (event.target === el.detectModal) closeDetectModal();
+    });
+  }
+
+  if (el.btnSpriteSelectAll) {
+    el.btnSpriteSelectAll.addEventListener("click", () => {
+      for (const sprite of state.characters.sprites) {
+        state.characters.selectedSpriteIds[sprite.id] = true;
+      }
+      renderSpritePalette();
+      updateGeneralButtonStates();
+    });
+  }
+  if (el.btnSpriteClearSelection) {
+    el.btnSpriteClearSelection.addEventListener("click", () => {
+      state.characters.selectedSpriteIds = {};
+      renderSpritePalette();
+      updateGeneralButtonStates();
+    });
+  }
+  if (el.btnSpriteDeleteSelected) {
+    el.btnSpriteDeleteSelected.addEventListener("click", async () => {
+      const ids = Object.keys(state.characters.selectedSpriteIds || {})
+        .filter((k) => state.characters.selectedSpriteIds[k])
+        .map((k) => Number(k));
+      if (!ids.length) return;
+      if (!window.confirm(`Delete ${ids.length} selected sprite(s)?`)) return;
+      try {
+        await deleteSpritesByIds(ids);
+      } catch (err) {
+        setStatus(`Delete failed: ${err.message}`);
+      }
+    });
+  }
 
   el.btnCreateAction.addEventListener("click", () => {
     const action = ensureAction(el.actionNameInput.value);
@@ -5166,12 +6370,9 @@ function bindEvents() {
 
   el.btnSaveCharacterJson.addEventListener("click", async () => {
     try {
-      await saveCharacterBundle();
+      await persistCharacterAutosave();
+      setStatus("Character saved.");
     } catch (err) {
-      if (err?.name === "AbortError") {
-        setStatus("Save cancelled.");
-        return;
-      }
       setStatus(`Character save failed: ${err.message}`);
     }
   });
@@ -5188,6 +6389,166 @@ function bindEvents() {
       event.target.value = "";
     }
   });
+
+  if (el.spriteEditorPreset) {
+    el.spriteEditorPreset.addEventListener("change", () => {
+      const [w, h] = String(el.spriteEditorPreset.value || "16x16").split("x").map((n) => Number(n));
+      resetSpriteEditor(w || 16, h || 16);
+      setSpriteEditorStatus(`New ${w}x${h} canvas.`);
+    });
+  }
+  if (el.spriteEditorBrush) {
+    el.spriteEditorBrush.addEventListener("change", () => {
+      state.characters.editor.brushSize = Math.max(1, Math.min(16, Number(el.spriteEditorBrush.value) || 1));
+    });
+  }
+  if (el.spriteEditorZoom) {
+    el.spriteEditorZoom.addEventListener("change", () => {
+      state.characters.editor.zoom = Math.max(8, Math.min(40, Number(el.spriteEditorZoom.value) || 16));
+      renderSpriteEditorCanvas();
+    });
+  }
+  if (el.spriteEditorColor) {
+    el.spriteEditorColor.addEventListener("change", () => {
+      state.characters.editor.color = el.spriteEditorColor.value || "#ffffff";
+    });
+  }
+  if (el.btnSpriteEditorNew) {
+    el.btnSpriteEditorNew.addEventListener("click", () => {
+      const [w, h] = String(el.spriteEditorPreset?.value || "16x16").split("x").map((n) => Number(n));
+      resetSpriteEditor(w || 16, h || 16);
+      setSpriteEditorStatus("New canvas created.");
+    });
+  }
+  if (el.btnSpriteEditorUndo) {
+    el.btnSpriteEditorUndo.addEventListener("click", () => {
+      const ed = state.characters.editor;
+      if (!ed.undoStack.length || !ed.imageData) return;
+      ed.redoStack.push(new Uint8ClampedArray(ed.imageData.data));
+      const prev = ed.undoStack.pop();
+      ed.imageData = new ImageData(prev, ed.width, ed.height);
+      renderSpriteEditorCanvas();
+    });
+  }
+  if (el.btnSpriteEditorRedo) {
+    el.btnSpriteEditorRedo.addEventListener("click", () => {
+      const ed = state.characters.editor;
+      if (!ed.redoStack.length || !ed.imageData) return;
+      ed.undoStack.push(new Uint8ClampedArray(ed.imageData.data));
+      const next = ed.redoStack.pop();
+      ed.imageData = new ImageData(next, ed.width, ed.height);
+      renderSpriteEditorCanvas();
+    });
+  }
+  if (el.btnSpriteEditorClear) {
+    el.btnSpriteEditorClear.addEventListener("click", () => {
+      spriteEditorPushUndoState();
+      resetSpriteEditor(state.characters.editor.width, state.characters.editor.height);
+      setSpriteEditorStatus("Canvas cleared.");
+    });
+  }
+  if (el.btnSpriteEditorPickBg) {
+    el.btnSpriteEditorPickBg.addEventListener("click", () => {
+      const action = getSelectedAction();
+      if (!action) {
+        setSpriteEditorStatus("Select an action first.");
+        return;
+      }
+      if (!state.characters.editor.imageData) {
+        setSpriteEditorStatus("Open or create a sprite first.");
+        return;
+      }
+      state.characters.editor.pickBackgroundMode = !state.characters.editor.pickBackgroundMode;
+      if (state.characters.editor.pickBackgroundMode) {
+        setSpriteEditorStatus("Click a pixel in the editor to set action background color.");
+      } else {
+        setSpriteEditorStatus("Background color picking cancelled.");
+      }
+      updateGeneralButtonStates();
+    });
+  }
+  if (el.spriteEditorCanvas) {
+    el.spriteEditorCanvas.addEventListener("pointerdown", (event) => {
+      event.preventDefault();
+      if (state.characters.editor.pickBackgroundMode) {
+        pickActionBackgroundColorFromEditor(event.clientX, event.clientY);
+        return;
+      }
+      state.characters.editor.isDrawing = true;
+      spriteEditorPushUndoState();
+      const erase = event.button === 2;
+      drawOnSpriteEditor(event.clientX, event.clientY, erase);
+    });
+    el.spriteEditorCanvas.addEventListener("pointermove", (event) => {
+      if (!state.characters.editor.isDrawing) return;
+      const erase = event.buttons === 2;
+      drawOnSpriteEditor(event.clientX, event.clientY, erase);
+    });
+    window.addEventListener("pointerup", () => {
+      if (state.characters.editor.isDrawing) {
+        state.characters.editor.isDrawing = false;
+      }
+    });
+    el.spriteEditorCanvas.addEventListener("contextmenu", (event) => event.preventDefault());
+  }
+  if (el.spriteEditorOpenFile) {
+    el.spriteEditorOpenFile.addEventListener("change", async (event) => {
+      const [file] = event.target.files || [];
+      if (!file) return;
+      try {
+        const image = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error("Could not decode image."));
+            img.src = reader.result;
+          };
+          reader.onerror = () => reject(new Error("Could not read image file."));
+          reader.readAsDataURL(file);
+        });
+        applyImageToSpriteEditor(imageToImageData(image), file.name);
+        setSpriteEditorStatus(`Loaded local sprite: ${file.name}`);
+      } catch (err) {
+        setSpriteEditorStatus(`Open failed: ${err.message}`);
+      } finally {
+        event.target.value = "";
+      }
+    });
+  }
+  if (el.btnSpriteEditorOpenSelected) {
+    el.btnSpriteEditorOpenSelected.addEventListener("click", () => {
+      const ids = Object.keys(state.characters.selectedSpriteIds || {})
+        .filter((k) => state.characters.selectedSpriteIds[k])
+        .map((k) => Number(k));
+      if (ids.length !== 1) {
+        setSpriteEditorStatus("Select exactly one sprite to open.");
+        return;
+      }
+      const sprite = state.characters.sprites.find((s) => s.id === ids[0]);
+      if (!sprite) return;
+      applyImageToSpriteEditor(new ImageData(new Uint8ClampedArray(sprite.data), sprite.w, sprite.h), sprite.fileName || "sprite");
+      setSpriteEditorStatus(`Opened ${sprite.fileName || `#${sprite.id}`}`);
+    });
+  }
+  if (el.btnSpriteEditorSave) {
+    el.btnSpriteEditorSave.addEventListener("click", async () => {
+      try {
+        await saveSpriteEditorImage(true);
+      } catch (err) {
+        setSpriteEditorStatus(`Save failed: ${err.message}`);
+      }
+    });
+  }
+  if (el.btnSpriteEditorSaveAs) {
+    el.btnSpriteEditorSaveAs.addEventListener("click", async () => {
+      try {
+        await saveSpriteEditorImage(false);
+      } catch (err) {
+        setSpriteEditorStatus(`Save As failed: ${err.message}`);
+      }
+    });
+  }
 
   updateGeneralButtonStates();
 }
@@ -5682,13 +7043,19 @@ function restoreMapAutosave() {
 
 async function init() {
   renderDetectStrictnessUI();
+  closeDetectModal();
   switchView("map");
   renderActionSelect();
   renderActionTimeline();
   renderCharacterSearchResults();
+  resetSpriteEditor(16, 16);
   postClientLog("info", "app", "startup", { build: APP_BUILD });
   bindEvents();
-  await restoreCharacterAutosaveIfAny();
+  try {
+    await restoreCharacterAutosaveIfAny();
+  } catch (_e) {
+    // Character library may not exist yet.
+  }
   updateWizardDeviceSelect();
   renderWizardProgressTable();
   setWizardStatus("Wizard idle. Discover masters to begin.");

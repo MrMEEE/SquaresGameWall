@@ -508,6 +508,13 @@ button:disabled {
   gap: 10px;
 }
 
+.character-library-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+
 .character-search-row {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -534,6 +541,83 @@ button:disabled {
   gap: 8px;
 }
 
+.detect-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 16, 26, 0.55);
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+
+.detect-modal[hidden] {
+  display: none !important;
+}
+
+.detect-modal-card {
+  width: min(1100px, 100%);
+  max-height: 90vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fffdf9;
+  box-shadow: 0 24px 64px rgba(14, 18, 24, 0.28);
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.detect-modal-grid {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fff;
+  padding: 8px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
+  gap: 8px;
+  max-height: 48vh;
+  overflow: auto;
+}
+
+.detect-candidate-chip {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7fbff;
+  padding: 6px;
+  text-align: center;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.detect-candidate-chip.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px #8fdad3;
+}
+
+.detect-candidate-head {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+
+.detect-candidate-head input {
+  width: 14px;
+  height: 14px;
+}
+
+.detect-candidate-chip canvas {
+  width: 100%;
+  image-rendering: pixelated;
+  background: #101826;
+  border-radius: 4px;
+  margin-bottom: 4px;
+}
+
+.detect-modal-actions {
+  justify-content: flex-end;
+}
+
 #detectStrictnessValue {
   font-family: "IBM Plex Mono", monospace;
 }
@@ -541,7 +625,7 @@ button:disabled {
 .search-results {
   display: grid;
   gap: 8px;
-  max-height: 220px;
+  max-height: 660px;
   overflow: auto;
   padding-right: 4px;
 }
@@ -599,6 +683,22 @@ button:disabled {
   font-size: 11px;
   text-align: center;
   cursor: grab;
+}
+
+.sprite-chip.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px #90e0db;
+}
+
+.sprite-chip-head {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+
+.sprite-chip-head input {
+  width: 14px;
+  height: 14px;
 }
 
 .sprite-chip canvas {
@@ -677,8 +777,43 @@ button:disabled {
   image-rendering: pixelated;
 }
 
+.sprite-editor-controls {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.sprite-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  align-items: center;
+}
+
+#spriteEditorCanvas {
+  width: 100%;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background:
+    linear-gradient(45deg, #1b2a3e 25%, #162335 25%, #162335 50%, #1b2a3e 50%, #1b2a3e 75%, #162335 75%, #162335 100%);
+  background-size: 16px 16px;
+  image-rendering: pixelated;
+  cursor: crosshair;
+}
+
+#spriteEditorName {
+  min-width: 180px;
+}
+
 @media (max-width: 1200px) {
   .characters-grid {
     grid-template-columns: 1fr;
+  }
+
+  .sprite-editor-controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
