@@ -32,6 +32,11 @@ python3 -m http.server 8080
 
 Then open http://localhost:8080.
 
+## Run on OKD
+
+See [OKD.md](OKD.md) for a complete build and deployment guide, including persistent storage for `characters/`.
+BuildConfig manifest: [deploy/okd/buildconfig.yaml](deploy/okd/buildconfig.yaml)
+
 ## Mapping flow
 
 1. Keep the grid at 7x5 (or resize).
