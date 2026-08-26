@@ -47,22 +47,19 @@ Optional checks:
     oc get is gamewall
     oc get bc gamewall -o yaml | grep -A6 "output:"
 
+If you see `Operation not permitted` during image build on a `chgrp`/`chmod` step,
+use the current `Dockerfile` in this repo (it intentionally avoids privileged
+ownership mutation steps for OKD build pods).
+
+Rebuild after updating:
+
+    oc start-build gamewall --follow
+
 ## 3) Create persistent volume claim for character data
 
 Apply this PVC:
 
-    oc apply -f - <<'YAML'
-    apiVersion: v1
-    kind: PersistentVolumeClaim
-    metadata:
-      name: gamewall-characters
-    spec:
-      accessModes:
-        - ReadWriteOnce
-      resources:
-        requests:
-          storage: 2Gi
-    YAML
+oc apply -f deploy/okd/pvc.yaml
 
 Adjust storage class and size if your cluster requires it.
 
@@ -72,12 +69,12 @@ Create app:
 
     oc new-app --image-stream=gamewall:latest --name=gamewall
 
-Mount persistent storage at `/app/characters`:
+Mount persistent storage at `/opt/app-root/src/characters`:
 
     oc set volume deploy/gamewall \
       --add --name=characters \
       --type=pvc --claim-name=gamewall-characters \
-      --mount-path=/app/characters
+    --mount-path=/opt/app-root/src/characters
 
 Expose service as route:
 

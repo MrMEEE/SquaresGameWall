@@ -1,16 +1,11 @@
-FROM registry.access.redhat.com/ubi10/python-312-minimal
+FROM registry.access.redhat.com/ubi10/python-312-minimal:1787605542
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-WORKDIR /app
+WORKDIR /opt/app-root/src
 
-COPY . /app
-
-# OpenShift/OKD runs containers with a random UID. This keeps /app writable
-# for that UID (which is in root group 0).
-RUN chgrp -R 0 /app \
-    && chmod -R g=u /app
+COPY . /opt/app-root/src
 
 EXPOSE 8080
 
