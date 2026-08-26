@@ -21,10 +21,11 @@ If the project already exists:
 
 The container image is built from `Dockerfile`, which uses:
 
-    registry.access.redhat.com/ubi10/python-312:latest
+    registry.access.redhat.com/ubi10/python-312-minimal:1787605542
 
-Apply the BuildConfig manifest:
+Apply ImageStream and BuildConfig manifests:
 
+    oc apply -f deploy/okd/imagestream.yaml
     oc apply -f deploy/okd/buildconfig.yaml
 
 Start a build from the Git source configured in BuildConfig:
@@ -34,6 +35,17 @@ Start a build from the Git source configured in BuildConfig:
 This produces image stream tag `gamewall:latest` in your project.
 
 If the Git repository is private, add an SSH source secret and reference it in `deploy/okd/buildconfig.yaml`.
+
+If you see `InvalidOutputReference` with `Output image could not be resolved`, run:
+
+    oc apply -f deploy/okd/imagestream.yaml
+    oc patch buildconfig/gamewall --type=merge -p '{"spec":{"output":{"to":{"kind":"ImageStreamTag","name":"gamewall:latest"}}}}'
+    oc start-build gamewall --follow
+
+Optional checks:
+
+    oc get is gamewall
+    oc get bc gamewall -o yaml | grep -A6 "output:"
 
 ## 3) Create persistent volume claim for character data
 
