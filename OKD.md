@@ -69,12 +69,16 @@ Create app:
 
     oc new-app --image-stream=gamewall:latest --name=gamewall
 
+Ensure a Service exists for the deployment (required before route creation):
+
+        oc expose deploy/gamewall --port=8080 --target-port=8080 --name=gamewall
+
 Mount persistent storage at `/opt/app-root/src/characters`:
 
     oc set volume deploy/gamewall \
       --add --name=characters \
       --type=pvc --claim-name=gamewall-characters \
-    --mount-path=/opt/app-root/src/characters
+      --mount-path=/opt/app-root/src/characters
 
 Expose service as route:
 
