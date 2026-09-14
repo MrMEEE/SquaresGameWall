@@ -88,6 +88,7 @@ const state = {
   wizard: {
     active: false,
     selectedIp: "",
+    scanSubnet: "",
     currentIp: "",
     startNonce: 0,
     reportedLedCount: 0,
@@ -221,7 +222,12 @@ const el = {
   btnToggleLivePush: document.getElementById("btnToggleLivePush"),
   btnQueryMaster: document.getElementById("btnQueryMaster"),
   btnWizardDiscover: document.getElementById("btnWizardDiscover"),
+  wizardScanSubnet: document.getElementById("wizardScanSubnet"),
   wizardDeviceSelect: document.getElementById("wizardDeviceSelect"),
+  wizardManualIp: document.getElementById("wizardManualIp"),
+  wizardManualName: document.getElementById("wizardManualName"),
+  wizardManualLeds: document.getElementById("wizardManualLeds"),
+  btnWizardAddMaster: document.getElementById("btnWizardAddMaster"),
   wizardTileCountOverride: document.getElementById("wizardTileCountOverride"),
   btnWizardStartDevice: document.getElementById("btnWizardStartDevice"),
   btnWizardBlinkRed: document.getElementById("btnWizardBlinkRed"),
@@ -1656,6 +1662,16 @@ function updateGeneralButtonStates() {
     el.btnResize.disabled = !(validRowsCols && validMasters);
   }
 
+  if (el.btnWizardDiscover && el.wizardScanSubnet) {
+    const rawScope = String(el.wizardScanSubnet.value || "").trim();
+    el.btnWizardDiscover.disabled = Boolean(rawScope) && !normalizeScanSubnetScope(rawScope);
+  }
+
+  if (el.btnWizardAddMaster) {
+    const manualIp = String(el.wizardManualIp?.value || "").trim();
+    el.btnWizardAddMaster.disabled = !isValidIpv4(manualIp);
+  }
+
   if (el.btnCharSearch) {
     el.btnCharSearch.disabled = !(el.charSearchInput?.value || "").trim();
   }
@@ -2041,7 +2057,8 @@ function updateWizardDeviceSelect() {
     const opt = document.createElement("option");
     opt.value = dev.ip;
     const ledsText = dev.leds ? ` (${dev.leds} LEDs)` : "";
-    opt.textContent = `${dev.name || "Twinkly"} - ${dev.ip}${ledsText}`;
+    const manualTag = dev.manual ? " [manual]" : "";
+    opt.textContent = `${dev.name || "Twinkly"} - ${dev.ip}${ledsText}${manualTag}`;
     el.wizardDeviceSelect.appendChild(opt);
   }
 
@@ -3878,6 +3895,95 @@ async function importData(data) {
   saveMapAutosave();
 }
 
+function isValidIpv4(value) {
+  const text = String(value || "").trim();
+  const parts = text.split(".");
+  if (parts.length !== 4) return false;
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return false;
+    const n = Number(part);
+    if (!Number.isInteger(n) || n < 0 || n > 255) return false;
+  }
+  return true;
+}
+
+function normalizeScanSubnetScope(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+
+  const cidrMatch = raw.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\/24$/);
+  if (cidrMatch) {
+    const prefix = cidrMatch[1];
+    const parts = prefix.split(".").map((v) => Number(v));
+    if (parts.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+      return prefix;
+    }
+  }
+
+  const tripleMatch = raw.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (tripleMatch) {
+    const nums = [Number(tripleMatch[1]), Number(tripleMatch[2]), Number(tripleMatch[3])];
+    if (nums.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+      return `${nums[0]}.${nums[1]}.${nums[2]}`;
+    }
+  }
+
+  if (isValidIpv4(raw)) {
+    return raw.split(".").slice(0, 3).join(".");
+  }
+
+  return "";
+}
+
+function upsertDiscoveredDevice(nextDevice) {
+  if (!nextDevice || !nextDevice.ip) return;
+  const byIp = new Map();
+  for (const dev of state.discoveredDevices || []) {
+    if (dev && dev.ip) byIp.set(dev.ip, dev);
+  }
+
+  const previous = byIp.get(nextDevice.ip) || {};
+  byIp.set(nextDevice.ip, {
+    ...previous,
+    ...nextDevice,
+    manual: Boolean(nextDevice.manual || previous.manual),
+  });
+
+  state.discoveredDevices = Array.from(byIp.values())
+    .sort((a, b) => String(a.ip || "").localeCompare(String(b.ip || "")));
+}
+
+function addManualWizardMaster() {
+  const ip = String(el.wizardManualIp?.value || "").trim();
+  if (!isValidIpv4(ip)) {
+    setWizardStatus("Manual master IP must be a valid IPv4 address.");
+    return;
+  }
+
+  const customName = String(el.wizardManualName?.value || "").trim();
+  const rawLeds = Number(el.wizardManualLeds?.value);
+  const leds = Number.isInteger(rawLeds) && rawLeds > 0 ? rawLeds : 0;
+
+  upsertDiscoveredDevice({
+    ip,
+    name: customName || `Manual ${ip}`,
+    leds,
+    product: "manual",
+    manual: true,
+  });
+
+  state.wizard.selectedIp = ip;
+  updateWizardDeviceSelect();
+  if (el.wizardDeviceSelect) el.wizardDeviceSelect.value = ip;
+  renderDiscoveryResults();
+
+  if (el.discoveryStatus) {
+    el.discoveryStatus.textContent = `Manual master list has ${state.discoveredDevices.length} device(s).`;
+  }
+  setWizardStatus(`Manual master added: ${ip}.`);
+  saveMapAutosave();
+}
+
 async function discoverTwinklyDevices() {
   if (el.discoveryStatus) el.discoveryStatus.textContent = "Checking server…";
   if (el.discoveryResults) el.discoveryResults.innerHTML = "";
@@ -3885,24 +3991,37 @@ async function discoverTwinklyDevices() {
   state.discoveredDevices = [];
   updateWizardDeviceSelect();
 
-  // Verify the proxy/scan server is running.
-  let localip = null;
-  try {
-    const r = await fetch("/localip");
-    if (r.ok) {
-      const data = await r.json();
-      localip = (data.ips || [])[0] || null;
-    }
-  } catch (_e) {}
-
-  if (!localip) {
-    const msg = "server.py not running. Start with: python3 server.py then reload http://localhost:8080";
+  const requestedScope = String(el.wizardScanSubnet?.value || state.wizard.scanSubnet || "").trim();
+  let subnet = normalizeScanSubnetScope(requestedScope);
+  if (requestedScope && !subnet) {
+    const msg = "Invalid IP scope. Use A.B.C (for /24), A.B.C.D, or A.B.C.0/24.";
     if (el.discoveryStatus) el.discoveryStatus.textContent = `⚠️ ${msg}`;
     setWizardStatus(msg);
     return;
   }
 
-  const subnet = localip.split(".").slice(0, 3).join(".");
+  // Default to the subnet derived from local IP when scope is not explicitly set.
+  if (!subnet) {
+    let localip = null;
+    try {
+      const r = await fetch("/localip");
+      if (r.ok) {
+        const data = await r.json();
+        localip = (data.ips || [])[0] || null;
+      }
+    } catch (_e) {}
+
+    if (!localip) {
+      const msg = "Could not infer local subnet. Enter IP Scope manually (e.g. 192.168.60).";
+      if (el.discoveryStatus) el.discoveryStatus.textContent = `⚠️ ${msg}`;
+      setWizardStatus(msg);
+      return;
+    }
+    subnet = localip.split(".").slice(0, 3).join(".");
+  }
+
+  state.wizard.scanSubnet = subnet;
+  if (el.wizardScanSubnet) el.wizardScanSubnet.value = subnet;
   if (el.discoveryStatus) el.discoveryStatus.textContent = `Scanning ${subnet}.1–254 via server…`;
 
   try {
@@ -3947,6 +4066,12 @@ async function discoverTwinklyDevices() {
       } catch (_e) {
         // Ignore probe failures; scan results still stand.
       }
+    }
+
+    // Keep manually entered masters in the list even when direct probe fails.
+    for (const dev of previousDiscovered) {
+      if (!dev || !dev.manual || !dev.ip) continue;
+      if (!discoveredByIp.has(dev.ip)) discoveredByIp.set(dev.ip, dev);
     }
 
     state.discoveredDevices = Array.from(discoveredByIp.values())
@@ -4036,6 +4161,7 @@ function resetAll() {
   state.wizard = {
     active: false,
     selectedIp: "",
+    scanSubnet: "",
     currentIp: "",
     startNonce: 0,
     reportedLedCount: 0,
@@ -5877,6 +6003,43 @@ function bindEvents() {
     });
   }
 
+  if (el.wizardScanSubnet) {
+    el.wizardScanSubnet.addEventListener("change", () => {
+      const raw = String(el.wizardScanSubnet.value || "").trim();
+      const normalized = normalizeScanSubnetScope(raw);
+      if (raw && !normalized) {
+        setWizardStatus("Invalid IP scope. Use A.B.C, A.B.C.D, or A.B.C.0/24.");
+      } else if (normalized) {
+        el.wizardScanSubnet.value = normalized;
+      }
+      state.wizard.scanSubnet = normalized || "";
+      updateGeneralButtonStates();
+      saveMapAutosave();
+    });
+    el.wizardScanSubnet.addEventListener("input", () => {
+      updateGeneralButtonStates();
+    });
+  }
+
+  if (el.btnWizardAddMaster) {
+    el.btnWizardAddMaster.addEventListener("click", () => {
+      addManualWizardMaster();
+      updateGeneralButtonStates();
+    });
+  }
+
+  if (el.wizardManualIp) {
+    el.wizardManualIp.addEventListener("input", () => {
+      updateGeneralButtonStates();
+    });
+    el.wizardManualIp.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      addManualWizardMaster();
+      updateGeneralButtonStates();
+    });
+  }
+
   if (el.wizardDeviceSelect) {
     el.wizardDeviceSelect.addEventListener("change", () => {
       state.wizard.selectedIp = el.wizardDeviceSelect.value;
@@ -6589,6 +6752,7 @@ function buildMapSnapshot() {
     }),
     wizard: {
       selectedIp: state.wizard.selectedIp,
+      scanSubnet: state.wizard.scanSubnet || "",
       lockedTiles: { ...state.wizard.lockedTiles },
       assignments: state.wizard.assignments.slice(),
       tileCountOverrides: { ...state.wizard.tileCountOverrides },
@@ -6728,6 +6892,8 @@ function applyMapSnapshot(d) {
   state.masterLeds = {};
   state.tileRotations = {};
   state.wizard.selectedIp = String(d.wizard?.selectedIp || "");
+  state.wizard.scanSubnet = normalizeScanSubnetScope(d.wizard?.scanSubnet || "") || "";
+  if (el.wizardScanSubnet) el.wizardScanSubnet.value = state.wizard.scanSubnet;
   state.wizard.lockedTiles = {};
   state.wizard.assignments = [];
   state.wizard.tileCountOverrides = (d.wizard && typeof d.wizard.tileCountOverrides === "object" && d.wizard.tileCountOverrides)

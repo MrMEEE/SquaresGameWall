@@ -69,12 +69,25 @@
           <h4>Hardware Wizard</h4>
           <div class="wizard-grid">
             <button id="btnWizardDiscover" class="secondary" type="button">Discover Masters</button>
+            <label>IP Scope (/24 prefix)
+              <input id="wizardScanSubnet" type="text" placeholder="192.168.60" spellcheck="false" />
+            </label>
             <label>Discovered Master
               <select id="wizardDeviceSelect"></select>
             </label>
             <label>Tile Count Override (selected master)
               <input id="wizardTileCountOverride" type="number" min="1" max="15" placeholder="Auto" />
             </label>
+            <label>Manual Master IP
+              <input id="wizardManualIp" type="text" placeholder="192.168.60.101" spellcheck="false" />
+            </label>
+            <label>Manual Master Name (optional)
+              <input id="wizardManualName" type="text" placeholder="Living Room Master" spellcheck="false" />
+            </label>
+            <label>Manual LEDs (optional)
+              <input id="wizardManualLeds" type="number" min="1" max="4096" placeholder="e.g. 960" />
+            </label>
+            <button id="btnWizardAddMaster" class="secondary" type="button">Add Manual Master</button>
           </div>
           <div class="wizard-start-row">
             <button id="btnWizardStartDevice" class="secondary" type="button">Start Mapping Selected</button>
@@ -102,6 +115,8 @@
             <button id="btnWizardCancel" class="danger" type="button">Cancel Wizard</button>
           </div>
           <div id="wizardStatus" class="hint">Wizard idle. Discover masters to begin.</div>
+          <div id="discoveryStatus" class="hint">No discovery yet.</div>
+          <div id="discoveryResults"></div>
           <div class="wizard-progress-wrap">
             <table id="wizardProgressTable" class="wizard-progress-table" aria-label="Wizard mapping progress">
               <thead>
@@ -320,6 +335,6 @@
     <p>Status: <span id="statusText">Ready.</span></p>
   </footer>
 
-  <script src="app.js?v=20260819-charstudio10"></script>
+  <script src="app.js?v=20260914-wizardscope1"></script>
 </body>
 </html>
