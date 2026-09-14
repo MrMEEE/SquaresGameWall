@@ -1,6 +1,6 @@
 const SVG_NS = "http://www.w3.org/2000/svg";
 const APP_BUILD = "20260818-charstudio1";
-const MAX_TILES_PER_MASTER = 15;
+const MAX_TILES_PER_MASTER = 16;
 const TILE_PIXEL_GRID = 8;
 const LEDS_PER_TILE = TILE_PIXEL_GRID * TILE_PIXEL_GRID;
 
@@ -104,6 +104,7 @@ const state = {
     assignments: [],
     queueIps: [],
     blinkTimerId: null,
+    blinkRunId: 0,
     blinkOn: false,
     blinkInFlight: false,
     segmentLedGroups: [],
@@ -111,7 +112,6 @@ const state = {
     segmentResolvedGroupIndex: {},
     currentProbeGroupIndex: null,
     probeCursor: 0,
-    tileCountOverrides: {},
   },
   demoPreset: "mario",
   demoOffsetX: 0,
@@ -226,9 +226,7 @@ const el = {
   wizardDeviceSelect: document.getElementById("wizardDeviceSelect"),
   wizardManualIp: document.getElementById("wizardManualIp"),
   wizardManualName: document.getElementById("wizardManualName"),
-  wizardManualLeds: document.getElementById("wizardManualLeds"),
   btnWizardAddMaster: document.getElementById("btnWizardAddMaster"),
-  wizardTileCountOverride: document.getElementById("wizardTileCountOverride"),
   btnWizardStartDevice: document.getElementById("btnWizardStartDevice"),
   btnWizardBlinkRed: document.getElementById("btnWizardBlinkRed"),
   btnWizardShowYellow: document.getElementById("btnWizardShowYellow"),
@@ -1939,38 +1937,13 @@ function ensurePassiveHardwareMirror() {
   }, 100);
 }
 
-function getWizardOverrideTileCountForIp(ip) {
-  const v = Number(state.wizard.tileCountOverrides[ip]);
-  if (!Number.isInteger(v) || v < 1 || v > MAX_TILES_PER_MASTER) return null;
-  return v;
-}
-
-function updateWizardOverrideInputForSelection() {
-  if (!el.wizardTileCountOverride) return;
-  const ip = (el.wizardDeviceSelect?.value || state.wizard.selectedIp || "").trim();
-  if (!ip) {
-    el.wizardTileCountOverride.value = "";
-    return;
-  }
-  const override = getWizardOverrideTileCountForIp(ip);
-  el.wizardTileCountOverride.value = override ? String(override) : "";
-}
-
-function inferSegmentsFromLedCount(ip, ledCountRaw) {
-  const overrideTiles = getWizardOverrideTileCountForIp(ip);
-  if (overrideTiles) {
-    return {
-      segments: overrideTiles,
-      effectiveLedCount: overrideTiles * LEDS_PER_TILE,
-      reason: `using override ${overrideTiles} tile(s)`,
-    };
-  }
+function inferSegmentsFromLedCount(_ip, ledCountRaw) {
 
   const raw = Number(ledCountRaw || 0);
   const inferred = raw > 0 ? Math.max(1, Math.round(raw / LEDS_PER_TILE)) : 1;
 
   if (inferred > MAX_TILES_PER_MASTER) {
-    const fallback = 15;
+    const fallback = MAX_TILES_PER_MASTER;
     return {
       segments: fallback,
       effectiveLedCount: fallback * LEDS_PER_TILE,
@@ -1986,6 +1959,7 @@ function inferSegmentsFromLedCount(ip, ledCountRaw) {
 }
 
 function stopWizardRedBlink() {
+  state.wizard.blinkRunId = Number(state.wizard.blinkRunId || 0) + 1;
   if (state.wizard.blinkTimerId != null) {
     clearTimeout(state.wizard.blinkTimerId);
     state.wizard.blinkTimerId = null;
@@ -2065,7 +2039,6 @@ function updateWizardDeviceSelect() {
   if (state.wizard.selectedIp) {
     el.wizardDeviceSelect.value = state.wizard.selectedIp;
   }
-  updateWizardOverrideInputForSelection();
   updateWizardControlStates();
 }
 
@@ -2517,9 +2490,14 @@ async function pushWizardSegmentPattern(pattern, rotation = 0) {
 function startWizardRedBlink() {
   if (!state.wizard.active) return;
   stopWizardRedBlink();
+  const runId = state.wizard.blinkRunId;
   let failureCount = 0;
 
   const tick = async () => {
+    if (runId !== state.wizard.blinkRunId) {
+      state.wizard.blinkTimerId = null;
+      return;
+    }
     if (!state.wizard.active || state.wizard.phase !== "locate") {
       state.wizard.blinkTimerId = null;
       return;
@@ -2530,6 +2508,10 @@ function startWizardRedBlink() {
       try {
         state.wizard.blinkOn = !state.wizard.blinkOn;
         await pushWizardSegmentPattern(state.wizard.blinkOn ? "red" : "off", 0);
+        if (runId !== state.wizard.blinkRunId) {
+          state.wizard.blinkTimerId = null;
+          return;
+        }
         failureCount = 0;
       } catch (err) {
         failureCount += 1;
@@ -2549,6 +2531,10 @@ function startWizardRedBlink() {
       }
     }
 
+    if (runId !== state.wizard.blinkRunId) {
+      state.wizard.blinkTimerId = null;
+      return;
+    }
     state.wizard.blinkTimerId = setTimeout(tick, 500);
   };
 
@@ -2680,11 +2666,13 @@ async function wizardShowYellow() {
     setWizardStatus("Select a map tile first.");
     return;
   }
+
+  // Flip phase before push so any late blink tick exits without repainting red.
+  state.wizard.phase = "orient";
+  state.wizard.yellowShown = true;
   stopWizardRedBlink();
   const rot = state.tileRotations[state.selectedTileId] || 0;
   await pushWizardSegmentPattern("yellow", rot);
-  state.wizard.phase = "orient";
-  state.wizard.yellowShown = true;
   setWizardStatus("Yellow orientation shown. Rotate left/right until the two yellow rows are UP, then Confirm Orientation.");
   updateWizardControlStates();
 }
@@ -2892,12 +2880,10 @@ async function wizardConfirmTile() {
   if (segment === 0) {
     const rawLeds = state.wizard.rawLedCount || state.wizard.ledCount || LEDS_PER_TILE;
     const inferred = inferSegmentsFromLedCount(ip, rawLeds);
-    const overrideTiles = getWizardOverrideTileCountForIp(ip);
     const layoutGroupCount = Array.isArray(state.wizard.segmentLedGroups)
       ? state.wizard.segmentLedGroups.length
       : 0;
-    const useLayoutGroups = !overrideTiles
-      && layoutGroupCount >= 1
+    const useLayoutGroups = layoutGroupCount >= 1
       && layoutGroupCount <= MAX_TILES_PER_MASTER;
     const effectiveLedCount = useLayoutGroups
       ? layoutGroupCount * LEDS_PER_TILE
@@ -3048,8 +3034,7 @@ async function wizardStartForIp(ip) {
   let rawLedCount = Number(discovered?.leds || 0);
   let reportedLedCount = 0;
   if (!rawLedCount) {
-    const overrideTiles = getWizardOverrideTileCountForIp(ip);
-    rawLedCount = overrideTiles ? overrideTiles * LEDS_PER_TILE : LEDS_PER_TILE;
+    rawLedCount = LEDS_PER_TILE;
   }
   const inferredInit = inferSegmentsFromLedCount(ip, rawLedCount);
 
@@ -3105,7 +3090,6 @@ async function wizardStartNextDevice() {
   }
   const nextIp = state.wizard.queueIps.shift();
   if (el.wizardDeviceSelect) el.wizardDeviceSelect.value = nextIp;
-  updateWizardOverrideInputForSelection();
   updateWizardControlStates();
   await wizardStartForIp(nextIp);
 }
@@ -3961,13 +3945,10 @@ function addManualWizardMaster() {
   }
 
   const customName = String(el.wizardManualName?.value || "").trim();
-  const rawLeds = Number(el.wizardManualLeds?.value);
-  const leds = Number.isInteger(rawLeds) && rawLeds > 0 ? rawLeds : 0;
 
   upsertDiscoveredDevice({
     ip,
     name: customName || `Manual ${ip}`,
-    leds,
     product: "manual",
     manual: true,
   });
@@ -4123,24 +4104,6 @@ function renderDiscoveryResults() {
     label.textContent = `${dev.name} (${dev.ip})` + (dev.leds ? ` — ${dev.leds} LEDs` : "");
     row.appendChild(label);
 
-    const assignBtn = document.createElement("button");
-    assignBtn.type = "button";
-    assignBtn.textContent = "Assign to selected master";
-    assignBtn.addEventListener("click", () => {
-      const tile = getTileById(state.selectedTileId);
-      if (!tile || !tile.isMaster) {
-        setStatus("Select a master tile first, then assign a device.");
-        return;
-      }
-      state.masterIPs[tile.id] = dev.ip;
-      if (dev.leds) state.masterLeds[tile.id] = dev.leds;
-      el.masterIpInput.value = dev.ip;
-      renderTileDetails();
-      render();
-      setStatus(`Assigned ${dev.name} (${dev.ip}) → master tile ${tile.id}.`);
-    });
-    row.appendChild(assignBtn);
-
     el.discoveryResults.appendChild(row);
   }
 }
@@ -4177,6 +4140,7 @@ function resetAll() {
     assignments: [],
     queueIps: [],
     blinkTimerId: null,
+    blinkRunId: 0,
     blinkOn: false,
     blinkInFlight: false,
     segmentLedGroups: [],
@@ -4184,7 +4148,6 @@ function resetAll() {
     segmentResolvedGroupIndex: {},
     currentProbeGroupIndex: null,
     probeCursor: 0,
-    tileCountOverrides: {},
   };
   updateWizardDeviceSelect();
   renderWizardProgressTable();
@@ -6043,34 +6006,9 @@ function bindEvents() {
   if (el.wizardDeviceSelect) {
     el.wizardDeviceSelect.addEventListener("change", () => {
       state.wizard.selectedIp = el.wizardDeviceSelect.value;
-      updateWizardOverrideInputForSelection();
       if (state.wizard.selectedIp) {
         setWizardStatus(`Selected discovered master ${state.wizard.selectedIp}. Start mapping when ready.`);
       }
-      updateWizardControlStates();
-      saveMapAutosave();
-    });
-  }
-
-  if (el.wizardTileCountOverride) {
-    el.wizardTileCountOverride.addEventListener("change", () => {
-      const ip = (el.wizardDeviceSelect?.value || state.wizard.selectedIp || "").trim();
-      if (!ip) {
-        el.wizardTileCountOverride.value = "";
-        updateWizardControlStates();
-        return;
-      }
-
-      const raw = Number(el.wizardTileCountOverride.value);
-      if (Number.isInteger(raw) && raw >= 1 && raw <= MAX_TILES_PER_MASTER) {
-        state.wizard.tileCountOverrides[ip] = raw;
-        setWizardStatus(`Tile override for ${ip} set to ${raw}.`);
-      } else {
-        delete state.wizard.tileCountOverrides[ip];
-        el.wizardTileCountOverride.value = "";
-        setWizardStatus(`Tile override for ${ip} cleared (auto).`);
-      }
-
       updateWizardControlStates();
       saveMapAutosave();
     });
@@ -6755,7 +6693,6 @@ function buildMapSnapshot() {
       scanSubnet: state.wizard.scanSubnet || "",
       lockedTiles: { ...state.wizard.lockedTiles },
       assignments: state.wizard.assignments.slice(),
-      tileCountOverrides: { ...state.wizard.tileCountOverrides },
     },
     demoPreset: state.demoPreset,
     demoOffsetX: state.demoOffsetX,
@@ -6896,9 +6833,6 @@ function applyMapSnapshot(d) {
   if (el.wizardScanSubnet) el.wizardScanSubnet.value = state.wizard.scanSubnet;
   state.wizard.lockedTiles = {};
   state.wizard.assignments = [];
-  state.wizard.tileCountOverrides = (d.wizard && typeof d.wizard.tileCountOverrides === "object" && d.wizard.tileCountOverrides)
-    ? d.wizard.tileCountOverrides
-    : {};
   state.wizard.queueIps = [];
   state.wizard.blinkTimerId = null;
   state.wizard.blinkOn = false;
