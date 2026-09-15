@@ -1746,13 +1746,28 @@ function getWizardGroupCount() {
   return Array.isArray(state.wizard.segmentLedGroups) ? state.wizard.segmentLedGroups.length : 0;
 }
 
+function getWizardProbeGroupCount() {
+  const explicit = getWizardGroupCount();
+  if (explicit > 0) return explicit;
+
+  const ledBased = Math.floor(
+    Math.max(Number(state.wizard.ledCount || 0), Number(state.wizard.rawLedCount || 0)) / LEDS_PER_TILE
+  );
+  const totalBased = Number(state.wizard.totalSegments || 0);
+  const inferred = Math.max(ledBased || 0, totalBased || 0, 1);
+  return Math.max(1, Math.min(MAX_TILES_PER_MASTER, inferred));
+}
+
 function isWizardManualProbeMode() {
-  return getWizardGroupCount() > MAX_TILES_PER_MASTER && state.wizard.currentSegment > 0;
+  if (state.wizard.currentSegment <= 0) return false;
+  const explicitGroups = getWizardGroupCount();
+  if (explicitGroups === 0) return getWizardProbeGroupCount() > 1;
+  return explicitGroups > MAX_TILES_PER_MASTER;
 }
 
 function ensureWizardProbeIndexForCurrentSegment() {
   if (!isWizardManualProbeMode()) return;
-  const groupCount = getWizardGroupCount();
+  const groupCount = getWizardProbeGroupCount();
   const seg = state.wizard.currentSegment;
   const resolved = state.wizard.segmentResolvedGroupIndex?.[seg];
   if (Number.isInteger(resolved) && resolved >= 0 && resolved < groupCount) {
@@ -1807,7 +1822,7 @@ function renderWizardGroupBadge() {
     return;
   }
 
-  const total = getWizardGroupCount();
+  const total = getWizardProbeGroupCount();
   const current = Number.isInteger(state.wizard.currentProbeGroupIndex)
     ? (state.wizard.currentProbeGroupIndex + 1)
     : 0;
@@ -2583,7 +2598,8 @@ function getWizardSegmentIndices(segment, transportLedCount, activeLedCount) {
   if (transportMax <= 0) return [];
 
   const groups = state.wizard.segmentLedGroups;
-  const inProbeMode = Array.isArray(groups) && groups.length > MAX_TILES_PER_MASTER && segment > 0;
+  const explicitGroups = Array.isArray(groups) ? groups.length : 0;
+  const inProbeMode = segment > 0 && ((explicitGroups > MAX_TILES_PER_MASTER) || explicitGroups === 0);
   let groupIndex = segment;
   if (inProbeMode) {
     const resolved = state.wizard.segmentResolvedGroupIndex?.[segment];
@@ -2825,7 +2841,7 @@ function buildWizardLocateStatus() {
   const debugIndices = getWizardSegmentIndices(state.wizard.currentSegment, debugTransport, state.wizard.ledCount || debugTransport);
   const firstIdx = debugIndices.length ? debugIndices[0] : "none";
   const lastIdx = debugIndices.length ? debugIndices[debugIndices.length - 1] : "none";
-  const groupCount = getWizardGroupCount();
+  const groupCount = getWizardProbeGroupCount();
   const probeTag = (isWizardManualProbeMode() && Number.isInteger(state.wizard.currentProbeGroupIndex))
     ? ` probe:${state.wizard.currentProbeGroupIndex + 1}/${groupCount}`
     : "";
@@ -2856,7 +2872,7 @@ async function wizardStepProbeGroup(delta) {
     setWizardStatus("Group stepping is only needed for slave segments when many candidate groups are exposed.");
     return;
   }
-  const groupCount = getWizardGroupCount();
+  const groupCount = getWizardProbeGroupCount();
   if (!groupCount) return;
   ensureWizardProbeIndexForCurrentSegment();
   const seg = state.wizard.currentSegment;
@@ -2905,14 +2921,14 @@ function wizardSelectCurrentProbeGroup() {
     return;
   }
   const idx = state.wizard.currentProbeGroupIndex;
-  const groups = state.wizard.segmentLedGroups;
-  if (!Number.isInteger(idx) || idx < 0 || idx >= groups.length) {
+  const groupCount = getWizardProbeGroupCount();
+  if (!Number.isInteger(idx) || idx < 0 || idx >= groupCount) {
     setWizardStatus("Choose a group first with Group Prev/Next.");
     return;
   }
   state.wizard.segmentResolvedGroupIndex[state.wizard.currentSegment] = idx;
   state.wizard.probeCursor = idx + 1;
-  setWizardStatus(`Group ${idx + 1}/${groups.length} selected for this segment. Now click its map tile location.`);
+  setWizardStatus(`Group ${idx + 1}/${groupCount} selected for this segment. Now click its map tile location.`);
   renderWizardGroupBadge();
   updateWizardControlStates();
 }
@@ -2967,8 +2983,12 @@ async function wizardSelectTileFromMap(tileId) {
   if (isWizardManualProbeMode()) {
     const resolved = state.wizard.segmentResolvedGroupIndex?.[state.wizard.currentSegment];
     if (!Number.isInteger(resolved)) {
-      setWizardStatus("Use Group Prev/Next and Select Group before choosing the tile location for this slave.");
-      return;
+      if (getWizardGroupCount() === 0 && Number.isInteger(state.wizard.currentProbeGroupIndex)) {
+        state.wizard.segmentResolvedGroupIndex[state.wizard.currentSegment] = state.wizard.currentProbeGroupIndex;
+      } else {
+        setWizardStatus("Use Group Prev/Next and Select Group before choosing the tile location for this slave.");
+        return;
+      }
     }
   }
 
