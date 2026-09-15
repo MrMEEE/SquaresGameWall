@@ -1542,6 +1542,11 @@ async function syncServerMirrorPlayback(force = false) {
     state.serverMirrorLastHash = signature;
     state.serverMirrorLastAt = now;
     return true;
+  } catch (err) {
+    // If mirror start fails, do not keep a stale signature from a prior run.
+    // Otherwise background auto-sync can incorrectly skip restart attempts.
+    state.serverMirrorLastHash = "";
+    throw err;
   } finally {
     state.serverMirrorSyncInFlight = false;
   }
@@ -1674,6 +1679,8 @@ async function setMapOutputEnabled(enabled) {
       state.outputEnabled = false;
       updateMapPowerButtonState();
       await stopServerMirrorPlayback();
+      state.serverMirrorLastHash = "";
+      state.serverMirrorLastAt = 0;
 
       const masters = Object.keys(state.masterIPs || {})
         .map((k) => Number(k))
