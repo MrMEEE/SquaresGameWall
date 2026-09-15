@@ -293,7 +293,8 @@ const el = {
   detectModalStatus: document.getElementById("detectModalStatus"),
   detectModalGrid: document.getElementById("detectModalGrid"),
   tileContextMenu: document.getElementById("tileContextMenu"),
-  btnCtxRotateTile: document.getElementById("btnCtxRotateTile"),
+  btnCtxRotateTileLeft: document.getElementById("btnCtxRotateTileLeft"),
+  btnCtxRotateTileRight: document.getElementById("btnCtxRotateTileRight"),
   btnCtxMapMore: document.getElementById("btnCtxMapMore"),
   btnCtxUnmapTile: document.getElementById("btnCtxUnmapTile"),
   btnDetectImportSelected: document.getElementById("btnDetectImportSelected"),
@@ -1345,12 +1346,12 @@ async function mapMoreForMaster(tileId) {
   setStatus(`Continuing mapping for master tile ${tile.id} (${ip}).`);
 }
 
-function rotateTileFromContextMenu() {
+function rotateTileFromContextMenu(delta = 90) {
   if (!Number.isInteger(tileContextMenuTileId)) return;
   const tile = getTileById(tileContextMenuTileId);
   if (!tile) return;
 
-  const next = ((state.tileRotations[tile.id] || 0) + 90) % 360;
+  const next = ((state.tileRotations[tile.id] || 0) + delta + 360) % 360;
   state.tileRotations[tile.id] = next;
   state.selectedTileId = tile.id;
   hideTileContextMenu();
@@ -6553,9 +6554,14 @@ function bindEvents() {
 
   el.gridSvg.addEventListener("pointerdown", beginDemoDrag);
   el.gridSvg.addEventListener("pointermove", moveDemoDrag);
-  if (el.btnCtxRotateTile) {
-    el.btnCtxRotateTile.addEventListener("click", () => {
-      rotateTileFromContextMenu();
+  if (el.btnCtxRotateTileLeft) {
+    el.btnCtxRotateTileLeft.addEventListener("click", () => {
+      rotateTileFromContextMenu(-90);
+    });
+  }
+  if (el.btnCtxRotateTileRight) {
+    el.btnCtxRotateTileRight.addEventListener("click", () => {
+      rotateTileFromContextMenu(90);
     });
   }
   if (el.btnCtxUnmapTile) {
