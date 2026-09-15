@@ -57,7 +57,7 @@ class MirrorRuntime:
             if thread:
                 thread.join(timeout=join_timeout)
 
-        def submit(self, frame_bytes, target_at=None, frame_id=0):
+        def submit(self, frame_bytes, target_at=None, frame_seq=0):
             if not isinstance(frame_bytes, (bytes, bytearray)) or len(frame_bytes) < 3:
                 return
             with self._lock:
@@ -65,7 +65,7 @@ class MirrorRuntime:
                 self._pending = {
                     "frameBytes": bytes(frame_bytes),
                     "targetAt": float(target_at) if target_at is not None else None,
-                    "frameId": int(frame_id),
+                    "frameSeq": int(frame_seq),
                 }
             self._event.set()
 
@@ -84,6 +84,12 @@ class MirrorRuntime:
                 payload = self._pending
                 self._pending = None
                 return payload
+
+        def _has_newer_pending(self, frame_seq):
+            with self._lock:
+                if self._pending is None:
+                    return False
+                return int(self._pending.get("frameSeq", -1)) > int(frame_seq)
 
         def _record_ok(self):
             stamp = _now_iso()
@@ -106,25 +112,32 @@ class MirrorRuntime:
                 if self._stop_event.is_set():
                     return
 
-                frame_bytes = self._take_pending()
-                if not frame_bytes:
+                pending = self._take_pending()
+                if not pending:
                     continue
 
-                target_at = frame_bytes.get("targetAt")
+                target_at = pending.get("targetAt")
+                frame_seq = int(pending.get("frameSeq", 0))
                 if target_at is not None:
-                    wait_s = target_at - time.perf_counter()
-                    if wait_s > 0:
-                        # Bounded wait to keep workers aligned without long blocking sleeps.
-                        self._stop_event.wait(min(wait_s, 0.030))
+                    while True:
                         if self._stop_event.is_set():
                             return
-                    # If this pending frame became stale while waiting, skip it.
-                    with self._lock:
-                        if self._pending is not None:
-                            continue
+                        wait_s = target_at - time.perf_counter()
+                        if wait_s <= 0:
+                            break
+                        if self._has_newer_pending(frame_seq):
+                            pending = None
+                            break
+                        self._stop_event.wait(min(wait_s, 0.005))
+                        if self._stop_event.is_set():
+                            return
+                if not pending:
+                    continue
+                if self._has_newer_pending(frame_seq):
+                    continue
 
                 try:
-                    self.runtime._push_rt_frame(self.ip, frame_bytes["frameBytes"])
+                    self.runtime._push_rt_frame(self.ip, pending["frameBytes"])
                     self._record_ok()
                 except Exception as exc:
                     self._record_err(str(exc))
@@ -145,7 +158,8 @@ class MirrorRuntime:
         self._last_error = ""
         self._push_ok = 0
         self._push_err = 0
-        self._dispatch_lead_s = 0.012
+        self._dispatch_lead_s = 0.020
+        self._dispatch_seq = 0
 
     def status(self):
         with self._lock:
@@ -197,6 +211,7 @@ class MirrorRuntime:
             self._last_push_at = ""
             self._push_ok = 0
             self._push_err = 0
+            self._dispatch_seq = 0
 
             current_ips = set(self._workers.keys())
             for ip in (current_ips - active_ips):
@@ -248,6 +263,8 @@ class MirrorRuntime:
                 frame = frames[idx]
                 self._frame_index = (idx + 1) % len(frames)
                 workers = dict(self._workers)
+                frame_seq = self._dispatch_seq
+                self._dispatch_seq += 1
 
             started = time.perf_counter()
             target_at = started + self._dispatch_lead_s
@@ -258,7 +275,7 @@ class MirrorRuntime:
                     continue
                 worker = workers.get(ip)
                 if worker:
-                    worker.submit(frame_bytes, target_at=target_at, frame_id=idx)
+                    worker.submit(frame_bytes, target_at=target_at, frame_seq=frame_seq)
 
             interval = 1.0 / max(1, fps)
             elapsed = time.perf_counter() - started
