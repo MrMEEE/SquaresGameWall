@@ -2482,9 +2482,47 @@ async function pushWizardSegmentPattern(pattern, rotation = 0) {
     }
   }
 
-  const token = await twinklyToken(ip);
-  await twinklySetRtMode(ip, token);
-  await twinklyPushFrame(ip, token, frameBytes);
+  const nowMs = Date.now();
+  const rtAgeMs = nowMs - Number(state.twinklyRtModeAt[ip] || 0);
+  const refreshRt = !state.twinklyRtMode[ip] || rtAgeMs > 5000;
+  const enteringRt = !state.twinklyRtMode[ip];
+
+  let token = await twinklyToken(ip);
+  try {
+    if (refreshRt) {
+      await twinklySetRtMode(ip, token);
+      state.twinklyRtMode[ip] = true;
+      state.twinklyRtModeAt[ip] = nowMs;
+    }
+
+    await twinklyPushFrame(ip, token, frameBytes);
+
+    // Prime first RT frame once to reduce occasional initial frame drop.
+    if (enteringRt) {
+      await twinklyPushFrame(ip, token, frameBytes);
+    }
+  } catch (firstErr) {
+    state.twinklyRtMode[ip] = false;
+    state.twinklyRtModeAt[ip] = 0;
+    state.twinklyRtFrameFormat[ip] = "";
+
+    // Recovery path: refresh auth token, re-enter RT mode, and resend once.
+    delete state.twinklyTokens[ip];
+    token = await twinklyToken(ip);
+    try {
+      await twinklySetRtMode(ip, token);
+      state.twinklyRtMode[ip] = true;
+      state.twinklyRtModeAt[ip] = Date.now();
+      await twinklyPushFrame(ip, token, frameBytes);
+      return;
+    } catch (retryErr) {
+      state.twinklyRtMode[ip] = false;
+      state.twinklyRtModeAt[ip] = 0;
+      throw new Error(
+        `${firstErr.message} (retry failed: ${retryErr.message}; leds=${transportLedCount}, bytes=${frameBytes.length})`
+      );
+    }
+  }
 }
 
 function startWizardRedBlink() {
