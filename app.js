@@ -1347,14 +1347,15 @@ async function mapMoreForMaster(tileId) {
 }
 
 function rotateTileFromContextMenu(delta = 90) {
-  if (!Number.isInteger(tileContextMenuTileId)) return;
-  const tile = getTileById(tileContextMenuTileId);
+  const tileId = Number.isInteger(tileContextMenuTileId) ? tileContextMenuTileId : null;
+  hideTileContextMenu();
+  if (!Number.isInteger(tileId)) return;
+  const tile = getTileById(tileId);
   if (!tile) return;
 
   const next = ((state.tileRotations[tile.id] || 0) + delta + 360) % 360;
   state.tileRotations[tile.id] = next;
   state.selectedTileId = tile.id;
-  hideTileContextMenu();
   renderTileDetails();
   render();
   saveMapAutosave();
@@ -1362,12 +1363,13 @@ function rotateTileFromContextMenu(delta = 90) {
 }
 
 function unmapTileFromContextMenu() {
-  if (!Number.isInteger(tileContextMenuTileId)) return;
-  const tile = getTileById(tileContextMenuTileId);
+  const tileId = Number.isInteger(tileContextMenuTileId) ? tileContextMenuTileId : null;
+  hideTileContextMenu();
+  if (!Number.isInteger(tileId)) return;
+  const tile = getTileById(tileId);
   if (!tile) return;
 
   state.selectedTileId = tile.id;
-  hideTileContextMenu();
 
   if (tile.isMaster) {
     const unmappedCount = unmapMasterChain(tile.id);
@@ -1390,9 +1392,9 @@ function unmapTileFromContextMenu() {
 }
 
 async function mapMoreFromContextMenu() {
-  if (!Number.isInteger(tileContextMenuTileId)) return;
-  const tileId = tileContextMenuTileId;
+  const tileId = Number.isInteger(tileContextMenuTileId) ? tileContextMenuTileId : null;
   hideTileContextMenu();
+  if (!Number.isInteger(tileId)) return;
   try {
     await mapMoreForMaster(tileId);
   } catch (err) {
