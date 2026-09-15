@@ -57,12 +57,16 @@ class MirrorRuntime:
             if thread:
                 thread.join(timeout=join_timeout)
 
-        def submit(self, frame_bytes):
+        def submit(self, frame_bytes, target_at=None, frame_id=0):
             if not isinstance(frame_bytes, (bytes, bytearray)) or len(frame_bytes) < 3:
                 return
             with self._lock:
                 # Latest-frame wins: overwrite stale pending frame to avoid queue lag.
-                self._pending = bytes(frame_bytes)
+                self._pending = {
+                    "frameBytes": bytes(frame_bytes),
+                    "targetAt": float(target_at) if target_at is not None else None,
+                    "frameId": int(frame_id),
+                }
             self._event.set()
 
         def snapshot(self):
@@ -106,8 +110,21 @@ class MirrorRuntime:
                 if not frame_bytes:
                     continue
 
+                target_at = frame_bytes.get("targetAt")
+                if target_at is not None:
+                    wait_s = target_at - time.perf_counter()
+                    if wait_s > 0:
+                        # Bounded wait to keep workers aligned without long blocking sleeps.
+                        self._stop_event.wait(min(wait_s, 0.030))
+                        if self._stop_event.is_set():
+                            return
+                    # If this pending frame became stale while waiting, skip it.
+                    with self._lock:
+                        if self._pending is not None:
+                            continue
+
                 try:
-                    self.runtime._push_rt_frame(self.ip, frame_bytes)
+                    self.runtime._push_rt_frame(self.ip, frame_bytes["frameBytes"])
                     self._record_ok()
                 except Exception as exc:
                     self._record_err(str(exc))
@@ -128,6 +145,7 @@ class MirrorRuntime:
         self._last_error = ""
         self._push_ok = 0
         self._push_err = 0
+        self._dispatch_lead_s = 0.012
 
     def status(self):
         with self._lock:
@@ -232,6 +250,7 @@ class MirrorRuntime:
                 workers = dict(self._workers)
 
             started = time.perf_counter()
+            target_at = started + self._dispatch_lead_s
             for master in frame.get("masters", []):
                 ip = master.get("ip")
                 frame_bytes = master.get("frameBytes")
@@ -239,7 +258,7 @@ class MirrorRuntime:
                     continue
                 worker = workers.get(ip)
                 if worker:
-                    worker.submit(frame_bytes)
+                    worker.submit(frame_bytes, target_at=target_at, frame_id=idx)
 
             interval = 1.0 / max(1, fps)
             elapsed = time.perf_counter() - started
@@ -346,7 +365,7 @@ class MirrorRuntime:
 
     def _push_rt_frame(self, ip, frame_bytes):
         token = self._token(ip)
-        refresh = (time.time() - float(self._rt_mode_at.get(ip, 0) or 0)) > 5
+        refresh = (time.time() - float(self._rt_mode_at.get(ip, 0) or 0)) > 20
         if refresh:
             self._set_rt_mode(ip, token)
             self._rt_mode_at[ip] = time.time()

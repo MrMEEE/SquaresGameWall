@@ -1,1 +1,3 @@
 characters/
+__pycache__/
+*.py[cod]
