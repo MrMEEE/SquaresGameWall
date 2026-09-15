@@ -1205,6 +1205,7 @@ function hideTileContextMenu() {
   tileContextMenuTileId = null;
   if (!el.tileContextMenu) return;
   el.tileContextMenu.hidden = true;
+  el.tileContextMenu.style.display = "none";
 }
 
 function isTileMapped(tileId) {
@@ -1233,6 +1234,7 @@ function showTileContextMenu(tileId, clientX, clientY) {
   }
 
   el.tileContextMenu.hidden = false;
+  el.tileContextMenu.style.display = "grid";
   const menuRect = el.tileContextMenu.getBoundingClientRect();
   const margin = 8;
   const x = Math.max(margin, Math.min(clientX, window.innerWidth - menuRect.width - margin));
@@ -1755,7 +1757,7 @@ function getWizardProbeGroupCount() {
   );
   const totalBased = Number(state.wizard.totalSegments || 0);
   const inferred = Math.max(ledBased || 0, totalBased || 0, 1);
-  return Math.max(1, Math.min(MAX_TILES_PER_MASTER, inferred));
+  return Math.max(1, inferred);
 }
 
 function isWizardManualProbeMode() {
@@ -2600,15 +2602,16 @@ function getWizardSegmentIndices(segment, transportLedCount, activeLedCount) {
   const groups = state.wizard.segmentLedGroups;
   const explicitGroups = Array.isArray(groups) ? groups.length : 0;
   const inProbeMode = segment > 0 && ((explicitGroups > MAX_TILES_PER_MASTER) || explicitGroups === 0);
+  const probeGroupCount = explicitGroups > 0 ? explicitGroups : getWizardProbeGroupCount();
   let groupIndex = segment;
   if (inProbeMode) {
     const resolved = state.wizard.segmentResolvedGroupIndex?.[segment];
-    if (Number.isInteger(resolved) && resolved >= 0 && resolved < groups.length) {
+    if (Number.isInteger(resolved) && resolved >= 0 && resolved < probeGroupCount) {
       groupIndex = resolved;
     } else if (
       Number.isInteger(state.wizard.currentProbeGroupIndex)
       && state.wizard.currentProbeGroupIndex >= 0
-      && state.wizard.currentProbeGroupIndex < groups.length
+      && state.wizard.currentProbeGroupIndex < probeGroupCount
       && segment === state.wizard.currentSegment
     ) {
       groupIndex = state.wizard.currentProbeGroupIndex;
@@ -2630,7 +2633,7 @@ function getWizardSegmentIndices(segment, transportLedCount, activeLedCount) {
   }
 
   if (contiguousMax <= 0) return [];
-  const start = segment * LEDS_PER_TILE;
+  const start = inProbeMode ? (groupIndex * LEDS_PER_TILE) : (segment * LEDS_PER_TILE);
   if (start >= contiguousMax) return [];
   const contiguous = [];
   for (let i = 0; i < LEDS_PER_TILE; i += 1) {
@@ -6596,6 +6599,11 @@ function bindEvents() {
       await mapMoreFromContextMenu();
     });
   }
+  document.addEventListener("pointerdown", (event) => {
+    if (!el.tileContextMenu || el.tileContextMenu.hidden) return;
+    if (el.tileContextMenu.contains(event.target)) return;
+    hideTileContextMenu();
+  }, true);
   document.addEventListener("click", (event) => {
     if (!el.tileContextMenu || el.tileContextMenu.hidden) return;
     if (el.tileContextMenu.contains(event.target)) return;
