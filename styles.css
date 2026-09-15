@@ -430,6 +430,25 @@ button:disabled {
   font-size: 12px;
 }
 
+.tile-context-menu {
+  position: fixed;
+  z-index: 1200;
+  min-width: 200px;
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
+}
+
+.tile-context-menu button {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+}
+
 .node {
   stroke: #4f5d68;
   stroke-width: 2;

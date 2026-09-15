@@ -291,6 +291,10 @@ const el = {
   detectModal: document.getElementById("detectModal"),
   detectModalStatus: document.getElementById("detectModalStatus"),
   detectModalGrid: document.getElementById("detectModalGrid"),
+  tileContextMenu: document.getElementById("tileContextMenu"),
+  btnCtxRotateTile: document.getElementById("btnCtxRotateTile"),
+  btnCtxMapMore: document.getElementById("btnCtxMapMore"),
+  btnCtxUnmapTile: document.getElementById("btnCtxUnmapTile"),
   btnDetectImportSelected: document.getElementById("btnDetectImportSelected"),
   btnDetectAddAll: document.getElementById("btnDetectAddAll"),
   btnDetectSelectAll: document.getElementById("btnDetectSelectAll"),
@@ -1174,6 +1178,7 @@ function toggleMaster(tileId) {
 }
 
 function onTileClick(tileId) {
+  hideTileContextMenu();
   const tile = getTileById(tileId);
   if (!tile) return;
 
@@ -1190,6 +1195,207 @@ function onTileClick(tileId) {
   render();
   runValidation();
   saveMapAutosave();
+}
+
+let tileContextMenuTileId = null;
+
+function hideTileContextMenu() {
+  tileContextMenuTileId = null;
+  if (!el.tileContextMenu) return;
+  el.tileContextMenu.hidden = true;
+}
+
+function isTileMapped(tileId) {
+  const tile = getTileById(tileId);
+  if (!tile) return false;
+  if (tile.isMaster && state.masterIPs[tile.id]) return true;
+  if (isTileLocked(tile.id)) return true;
+  return (state.wizard.assignments || []).some((a) => Number(a.tileId) === Number(tileId));
+}
+
+function showTileContextMenu(tileId, clientX, clientY) {
+  if (!el.tileContextMenu) return;
+  const tile = getTileById(tileId);
+  if (!tile) return;
+
+  tileContextMenuTileId = tileId;
+  const canMapMore = (() => {
+    if (!tile.isMaster) return false;
+    const ip = String(state.masterIPs[tile.id] || "").trim();
+    if (!ip) return false;
+    const mappedCount = getOrderedTilesForMaster(tile.id).length;
+    return mappedCount > 0 && mappedCount < MAX_TILES_PER_MASTER;
+  })();
+  if (el.btnCtxMapMore) {
+    el.btnCtxMapMore.hidden = !canMapMore;
+  }
+
+  el.tileContextMenu.hidden = false;
+  const menuRect = el.tileContextMenu.getBoundingClientRect();
+  const margin = 8;
+  const x = Math.max(margin, Math.min(clientX, window.innerWidth - menuRect.width - margin));
+  const y = Math.max(margin, Math.min(clientY, window.innerHeight - menuRect.height - margin));
+  el.tileContextMenu.style.left = `${x}px`;
+  el.tileContextMenu.style.top = `${y}px`;
+}
+
+function unmapTileById(tileId) {
+  state.wizard.assignments = (state.wizard.assignments || []).filter((a) => Number(a.tileId) !== Number(tileId));
+  delete state.wizard.lockedTiles[String(tileId)];
+  delete state.tileRotations[tileId];
+}
+
+function unmapMasterChain(masterTileId) {
+  const master = getTileById(masterTileId);
+  if (!master || !master.isMaster) return 0;
+  const masterIp = String(state.masterIPs[masterTileId] || "").trim();
+  const chain = new Set(getOrderedTilesForMaster(masterTileId));
+
+  if (masterIp) {
+    for (const item of state.wizard.assignments || []) {
+      if (item && item.ip === masterIp && Number.isInteger(item.tileId)) chain.add(item.tileId);
+    }
+  }
+  chain.add(masterTileId);
+
+  for (const id of chain) {
+    unmapTileById(id);
+  }
+
+  if (masterIp) {
+    state.wizard.assignments = (state.wizard.assignments || []).filter((a) => a.ip !== masterIp);
+    for (const [k, lock] of Object.entries(state.wizard.lockedTiles || {})) {
+      if (lock && lock.ip === masterIp) delete state.wizard.lockedTiles[k];
+    }
+    state.wizard.queueIps = (state.wizard.queueIps || []).filter((ip) => ip !== masterIp);
+  }
+
+  delete state.masterIPs[masterTileId];
+  delete state.masterLeds[masterTileId];
+  delete state.masterLedProbed[masterTileId];
+  return chain.size;
+}
+
+async function mapMoreForMaster(tileId) {
+  const tile = getTileById(tileId);
+  if (!tile || !tile.isMaster) {
+    setStatus("Map More is only available on mapped master tiles.");
+    return;
+  }
+
+  const ip = String(state.masterIPs[tile.id] || "").trim();
+  if (!ip) {
+    setStatus("Selected master has no assigned IP.");
+    return;
+  }
+
+  const mappedCount = getOrderedTilesForMaster(tile.id).length;
+  if (mappedCount >= MAX_TILES_PER_MASTER) {
+    setStatus(`Master tile ${tile.id} already has ${mappedCount} mapped tile(s).`);
+    return;
+  }
+
+  if (state.livePushActive) stopLivePush();
+  stopWizardRedBlink();
+
+  const discovered = state.discoveredDevices.find((d) => d.ip === ip);
+  const seedLeds = Number(discovered?.leds || state.masterLeds[tile.id] || LEDS_PER_TILE);
+  const inferred = inferSegmentsFromLedCount(ip, seedLeds);
+  const mappedSegments = (state.wizard.assignments || [])
+    .filter((a) => a.ip === ip && Number.isInteger(a.segment))
+    .map((a) => Number(a.segment));
+  const maxMappedSegment = mappedSegments.length ? Math.max(...mappedSegments) : 0;
+  const nextSegment = maxMappedSegment + 1;
+  const totalSegments = Math.max(nextSegment + 1, Math.min(MAX_TILES_PER_MASTER, inferred.segments));
+
+  state.wizard.startNonce = Number(state.wizard.startNonce || 0) + 1;
+  state.wizard.active = true;
+  state.wizard.currentIp = ip;
+  state.wizard.selectedIp = ip;
+  state.wizard.reportedLedCount = Number(state.masterLeds[tile.id] || 0);
+  state.wizard.rawLedCount = Math.max(seedLeds, inferred.effectiveLedCount);
+  state.wizard.ledCount = Math.max(Number(state.masterLeds[tile.id] || 0), inferred.effectiveLedCount);
+  state.wizard.totalSegments = totalSegments;
+  state.wizard.currentSegment = nextSegment;
+  state.wizard.phase = "locate";
+  state.wizard.yellowShown = false;
+  state.wizard.segmentGroupSource = "fallback";
+  state.wizard.currentProbeGroupIndex = null;
+  state.wizard.probeCursor = 0;
+  state.wizard.skippedSegments = [];
+  state.wizard.queueIps = (state.wizard.queueIps || [])
+    .filter((queuedIp) => queuedIp !== ip);
+
+  if (el.wizardDeviceSelect) el.wizardDeviceSelect.value = ip;
+  state.selectedTileId = tile.id;
+  render();
+  renderTileDetails();
+  renderWizardProgressTable();
+  updateWizardControlStates();
+  saveMapAutosave();
+
+  await wizardBlinkRed();
+  const nonceAtStart = state.wizard.startNonce;
+  refreshWizardMetadataInBackground(ip, nonceAtStart).catch((err) => {
+    if (!state.wizard.active || state.wizard.currentIp !== ip || state.wizard.startNonce !== nonceAtStart) return;
+    setWizardStatus(`Metadata probe warning on ${ip}: ${err.message}. Continuing with current mapping data.`);
+  });
+
+  setStatus(`Continuing mapping for master tile ${tile.id} (${ip}).`);
+}
+
+function rotateTileFromContextMenu() {
+  if (!Number.isInteger(tileContextMenuTileId)) return;
+  const tile = getTileById(tileContextMenuTileId);
+  if (!tile) return;
+
+  const next = ((state.tileRotations[tile.id] || 0) + 90) % 360;
+  state.tileRotations[tile.id] = next;
+  state.selectedTileId = tile.id;
+  hideTileContextMenu();
+  renderTileDetails();
+  render();
+  saveMapAutosave();
+  setStatus(`Tile ${tile.id} rotated to ${next}°.`);
+}
+
+function unmapTileFromContextMenu() {
+  if (!Number.isInteger(tileContextMenuTileId)) return;
+  const tile = getTileById(tileContextMenuTileId);
+  if (!tile) return;
+
+  state.selectedTileId = tile.id;
+  hideTileContextMenu();
+
+  if (tile.isMaster) {
+    const unmappedCount = unmapMasterChain(tile.id);
+    renderWizardProgressTable();
+    renderTileDetails();
+    render();
+    runValidation();
+    saveMapAutosave();
+    setStatus(`Unmapped master tile ${tile.id} and ${Math.max(0, unmappedCount - 1)} connected tile(s).`);
+    return;
+  }
+
+  unmapTileById(tile.id);
+  renderWizardProgressTable();
+  renderTileDetails();
+  render();
+  runValidation();
+  saveMapAutosave();
+  setStatus(`Unmapped tile ${tile.id}.`);
+}
+
+async function mapMoreFromContextMenu() {
+  if (!Number.isInteger(tileContextMenuTileId)) return;
+  const tileId = tileContextMenuTileId;
+  hideTileContextMenu();
+  try {
+    await mapMoreForMaster(tileId);
+  } catch (err) {
+    setWizardStatus(`Map More failed: ${err.message}`);
+  }
 }
 
 function getLayout() {
@@ -1468,7 +1674,7 @@ async function twinklyPushFrame(ip, token, rgbFrameBytes) {
     method: "POST",
     headers: { "Content-Type": "application/octet-stream", "X-Auth-Token": token },
     body: payload,
-    timeoutMs: 5000,
+    timeoutMs: 8000,
   });
 
   const cachedFormat = state.twinklyRtFrameFormat[ip];
@@ -2554,8 +2760,8 @@ function startWizardRedBlink() {
       } catch (err) {
         failureCount += 1;
         const msg = err && err.message ? err.message : String(err);
-        const hardNetworkFailure = /timed out|could not reach|networkerror|failed to fetch|proxy http 50/i.test(msg);
-        if (hardNetworkFailure || failureCount >= 2) {
+        // Keep retrying for transient startup hiccups; only abort after repeated failures.
+        if (failureCount >= 6) {
           stopWizardRedBlink();
           setWizardStatus(
             `Blink push failed on ${state.wizard.currentIp}: ${msg}. ` +
@@ -2563,7 +2769,9 @@ function startWizardRedBlink() {
           );
           return;
         }
-        setWizardStatus(`Blink push failed on ${state.wizard.currentIp}: ${msg}`);
+        setWizardStatus(
+          `Blink push retry ${failureCount}/6 on ${state.wizard.currentIp}: ${msg}`
+        );
       } finally {
         state.wizard.blinkInFlight = false;
       }
@@ -3057,7 +3265,7 @@ async function refreshWizardMetadataInBackground(ip, nonceAtStart) {
   updateWizardControlStates();
 }
 
-async function wizardStartForIp(ip) {
+async function wizardStartForIp(ip, options = {}) {
   if (!ip) {
     setWizardStatus("Choose a discovered master first.");
     return;
@@ -3066,7 +3274,7 @@ async function wizardStartForIp(ip) {
     stopLivePush();
   }
 
-  // Start immediately using discovered/override estimates. Device metadata
+  // Start immediately using discovered estimates. Device metadata
   // probing (gestalt + layout/config) runs in background to avoid start lag.
   const discovered = state.discoveredDevices.find((d) => d.ip === ip);
   let rawLedCount = Number(discovered?.leds || 0);
@@ -3095,7 +3303,33 @@ async function wizardStartForIp(ip) {
   state.wizard.probeCursor = 0;
   state.wizard.segmentTileIds = {};
   state.wizard.skippedSegments = [];
-  state.wizard.queueIps = state.discoveredDevices.map((d) => d.ip).filter((addr) => addr !== ip);
+  const preserveQueue = Boolean(options.preserveQueue);
+  const mappedMasterIps = new Set(
+    (state.wizard.assignments || [])
+      .filter((a) => Number(a.segment) === 0 && typeof a.ip === "string" && a.ip)
+      .map((a) => a.ip)
+  );
+  const discoveredIps = (state.discoveredDevices || [])
+    .map((d) => d && d.ip)
+    .filter((addr) => typeof addr === "string" && addr && addr !== ip && !mappedMasterIps.has(addr));
+
+  if (preserveQueue) {
+    const seen = new Set();
+    const nextQueue = [];
+    for (const addr of (state.wizard.queueIps || [])) {
+      if (typeof addr !== "string" || !addr || addr === ip || mappedMasterIps.has(addr) || seen.has(addr)) continue;
+      seen.add(addr);
+      nextQueue.push(addr);
+    }
+    for (const addr of discoveredIps) {
+      if (seen.has(addr)) continue;
+      seen.add(addr);
+      nextQueue.push(addr);
+    }
+    state.wizard.queueIps = nextQueue;
+  } else {
+    state.wizard.queueIps = discoveredIps;
+  }
 
   const selectedMasterTile = getTileById(state.selectedTileId);
   if (selectedMasterTile && selectedMasterTile.isMaster && state.masterIPs[selectedMasterTile.id] === ip) {
@@ -3129,7 +3363,7 @@ async function wizardStartNextDevice() {
   const nextIp = state.wizard.queueIps.shift();
   if (el.wizardDeviceSelect) el.wizardDeviceSelect.value = nextIp;
   updateWizardControlStates();
-  await wizardStartForIp(nextIp);
+  await wizardStartForIp(nextIp, { preserveQueue: true });
 }
 
 async function probeSelectedMaster() {
@@ -3582,6 +3816,18 @@ function render() {
 
     const group = makeSvgNode("g");
     group.addEventListener("click", () => onTileClick(tile.id));
+    group.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      state.selectedTileId = tile.id;
+      renderTileDetails();
+      render();
+      if (!isTileMapped(tile.id)) {
+        hideTileContextMenu();
+        setStatus(`Tile ${tile.id} is not mapped yet.`);
+        return;
+      }
+      showTileContextMenu(tile.id, event.clientX, event.clientY);
+    });
 
     const masterColor = masterColorMap.get(tile.id);
     const klass = ["node"];
@@ -6280,6 +6526,31 @@ function bindEvents() {
 
   el.gridSvg.addEventListener("pointerdown", beginDemoDrag);
   el.gridSvg.addEventListener("pointermove", moveDemoDrag);
+  if (el.btnCtxRotateTile) {
+    el.btnCtxRotateTile.addEventListener("click", () => {
+      rotateTileFromContextMenu();
+    });
+  }
+  if (el.btnCtxUnmapTile) {
+    el.btnCtxUnmapTile.addEventListener("click", () => {
+      unmapTileFromContextMenu();
+    });
+  }
+  if (el.btnCtxMapMore) {
+    el.btnCtxMapMore.addEventListener("click", async () => {
+      await mapMoreFromContextMenu();
+    });
+  }
+  document.addEventListener("click", (event) => {
+    if (!el.tileContextMenu || el.tileContextMenu.hidden) return;
+    if (el.tileContextMenu.contains(event.target)) return;
+    hideTileContextMenu();
+  });
+  window.addEventListener("scroll", hideTileContextMenu, true);
+  window.addEventListener("resize", hideTileContextMenu);
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") hideTileContextMenu();
+  });
   window.addEventListener("pointerup", endDemoDrag);
   window.addEventListener("pointercancel", endDemoDrag);
   window.addEventListener("beforeunload", () => {
