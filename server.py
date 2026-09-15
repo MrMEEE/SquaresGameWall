@@ -212,7 +212,7 @@ class MirrorRuntime:
                 ip,
                 "/xled/v1/gestalt",
                 method="GET",
-                timeout=4,
+                timeout=1.2,
             )
             if status < 200 or status >= 300:
                 return target
@@ -250,7 +250,21 @@ class MirrorRuntime:
         if not normalized:
             raise ValueError("no valid frames to run")
 
-        worker_fps = {ip: self._probe_target_fps(ip, safe_fps) for ip in active_ips}
+        # Probe all active masters in parallel so a slow/offline unit doesn't
+        # block the mirror start path for everyone else.
+        worker_fps = {}
+        if active_ips:
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(active_ips))) as pool:
+                future_map = {
+                    pool.submit(self._probe_target_fps, ip, safe_fps): ip
+                    for ip in active_ips
+                }
+                for future, ip in future_map.items():
+                    try:
+                        worker_fps[ip] = float(future.result(timeout=1.6))
+                    except Exception:
+                        worker_fps[ip] = float(safe_fps)
 
         self.stop(join_timeout=1.5)
         workers_to_stop = []

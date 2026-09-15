@@ -1474,9 +1474,30 @@ function buildServerMirrorPayload(masters) {
 
 async function stopServerMirrorPlayback() {
   try {
-    await fetch("/api/mirror/stop", { method: "POST" });
+    await fetchWithTimeout("/api/mirror/stop", {
+      method: "POST",
+      cache: "no-store",
+    }, 4500);
   } catch (_e) {
     // best effort
+  }
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 4500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(500, Number(timeoutMs) || 4500));
+  try {
+    return await fetch(url, {
+      ...(options || {}),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error(`request timed out after ${Math.max(500, Number(timeoutMs) || 4500)}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1502,12 +1523,12 @@ async function syncServerMirrorPlayback(force = false) {
   try {
     const payload = buildServerMirrorPayload(masters);
     if (!payload.frames.length) return false;
-    const res = await fetch("/api/mirror/start", {
+    const res = await fetchWithTimeout("/api/mirror/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       cache: "no-store",
-    });
+    }, 6000);
     if (!res.ok) {
       let msg = `server mirror start failed (${res.status})`;
       try {
@@ -1583,12 +1604,12 @@ function syncSyncLeadControls() {
 async function applyServerMirrorTuning() {
   if (!state.serverMirrorEnabled) return;
   try {
-    await fetch("/api/mirror/tuning", {
+    await fetchWithTimeout("/api/mirror/tuning", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ dispatchLeadMs: state.serverSyncLeadMs }),
       cache: "no-store",
-    });
+    }, 3500);
   } catch (_e) {
     // Best effort; tuning is also sent on next /api/mirror/start.
   }
