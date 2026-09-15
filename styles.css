@@ -113,6 +113,18 @@ h1 {
   margin-top: 0;
 }
 
+.map-brightness-row {
+  display: grid;
+  grid-template-columns: 1fr 112px;
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.map-brightness-row input[type="number"] {
+  width: 100%;
+}
+
 #gridSvg {
   width: 100%;
   max-height: 72vh;
@@ -441,6 +453,10 @@ button:disabled {
   border-radius: 10px;
   background: #ffffff;
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
+}
+
+.tile-context-menu[hidden] {
+  display: none !important;
 }
 
 .tile-context-menu button {

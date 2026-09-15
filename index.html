@@ -30,6 +30,13 @@
     <section class="panel left-panel">
       <h2>Map</h2>
 
+      <div class="map-brightness-row">
+        <label>Mapped Tile Brightness (%)
+          <input id="mappedBrightnessRange" type="range" min="0" max="200" step="1" value="100" />
+        </label>
+        <input id="mappedBrightnessNumber" type="number" min="0" max="200" step="1" value="100" />
+      </div>
+
       <svg id="gridSvg" viewBox="0 0 980 720" role="img" aria-label="Tile mapper"></svg>
 
       <p class="hint">
@@ -332,10 +339,11 @@
   <div id="tileContextMenu" class="tile-context-menu" hidden>
     <button id="btnCtxRotateTileLeft" type="button">Rotate Tile Left 90°</button>
     <button id="btnCtxRotateTileRight" type="button">Rotate Tile Right 90°</button>
+    <button id="btnCtxTileBrightness" type="button" class="secondary">Tile Brightness Offset...</button>
     <button id="btnCtxMapMore" type="button" class="secondary">Map More</button>
     <button id="btnCtxUnmapTile" type="button" class="danger">Unmap Tile</button>
   </div>
 
-  <script src="app.js?v=20260916-probegroup3"></script>
+  <script src="app.js?v=20260916-brightness1"></script>
 </body>
 </html>

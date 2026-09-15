@@ -78,6 +78,8 @@ const state = {
   masterLeds: {},
   masterLedProbed: {},
   tileRotations: {},
+  tileBrightnessOffsets: {},
+  mappedBrightness: 100,
   twinklyTokens: {},
   twinklyRtMode: {},
   twinklyRtModeAt: {},
@@ -255,6 +257,8 @@ const el = {
   rowsInput: document.getElementById("rowsInput"),
   colsInput: document.getElementById("colsInput"),
   mastersInput: document.getElementById("mastersInput"),
+  mappedBrightnessRange: document.getElementById("mappedBrightnessRange"),
+  mappedBrightnessNumber: document.getElementById("mappedBrightnessNumber"),
   btnResize: document.getElementById("btnResize"),
   btnReset: document.getElementById("btnReset"),
   btnExport: document.getElementById("btnExport"),
@@ -295,6 +299,7 @@ const el = {
   tileContextMenu: document.getElementById("tileContextMenu"),
   btnCtxRotateTileLeft: document.getElementById("btnCtxRotateTileLeft"),
   btnCtxRotateTileRight: document.getElementById("btnCtxRotateTileRight"),
+  btnCtxTileBrightness: document.getElementById("btnCtxTileBrightness"),
   btnCtxMapMore: document.getElementById("btnCtxMapMore"),
   btnCtxUnmapTile: document.getElementById("btnCtxUnmapTile"),
   btnDetectImportSelected: document.getElementById("btnDetectImportSelected"),
@@ -1216,12 +1221,66 @@ function isTileMapped(tileId) {
   return (state.wizard.assignments || []).some((a) => Number(a.tileId) === Number(tileId));
 }
 
+function clampBrightnessPercent(value, fallback = 100) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(200, Math.round(n)));
+}
+
+function getTileBrightnessOffset(tileId) {
+  const n = Number(state.tileBrightnessOffsets?.[tileId] || 0);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(-100, Math.min(100, Math.round(n)));
+}
+
+function getTileBrightnessScale(tileId) {
+  if (!isTileMapped(tileId)) return 1;
+  const globalPercent = clampBrightnessPercent(state.mappedBrightness, 100);
+  const tileOffset = getTileBrightnessOffset(tileId);
+  const effective = Math.max(0, Math.min(200, globalPercent + tileOffset));
+  return effective / 100;
+}
+
+function applyBrightnessToRgb(rgb, scale) {
+  const out = [0, 0, 0];
+  for (let i = 0; i < 3; i += 1) {
+    const n = Number(rgb?.[i] || 0);
+    out[i] = Math.max(0, Math.min(255, Math.round(n * scale)));
+  }
+  return out;
+}
+
+function syncMappedBrightnessControls() {
+  const value = clampBrightnessPercent(state.mappedBrightness, 100);
+  state.mappedBrightness = value;
+  if (el.mappedBrightnessRange) el.mappedBrightnessRange.value = String(value);
+  if (el.mappedBrightnessNumber) el.mappedBrightnessNumber.value = String(value);
+}
+
+function setMappedBrightness(value) {
+  const next = clampBrightnessPercent(value, 100);
+  if (next === state.mappedBrightness) {
+    syncMappedBrightnessControls();
+    return;
+  }
+  state.mappedBrightness = next;
+  syncMappedBrightnessControls();
+  render();
+  saveMapAutosave();
+  setStatus(`Mapped tile brightness set to ${next}%.`);
+}
+
 function showTileContextMenu(tileId, clientX, clientY) {
   if (!el.tileContextMenu) return;
   const tile = getTileById(tileId);
   if (!tile) return;
 
   tileContextMenuTileId = tileId;
+  if (el.btnCtxTileBrightness) {
+    const offset = getTileBrightnessOffset(tileId);
+    const sign = offset >= 0 ? "+" : "";
+    el.btnCtxTileBrightness.textContent = `Tile Brightness Offset (${sign}${offset}%)...`;
+  }
   const canMapMore = (() => {
     if (!tile.isMaster) return false;
     const ip = String(state.masterIPs[tile.id] || "").trim();
@@ -1404,6 +1463,52 @@ async function mapMoreFromContextMenu() {
   }
 }
 
+function setTileBrightnessOffsetFromContextMenu() {
+  const tileId = Number.isInteger(tileContextMenuTileId) ? tileContextMenuTileId : null;
+  hideTileContextMenu();
+  if (!Number.isInteger(tileId)) return;
+  if (!isTileMapped(tileId)) {
+    setStatus(`Tile ${tileId} is not mapped yet.`);
+    return;
+  }
+
+  const current = getTileBrightnessOffset(tileId);
+  const answer = window.prompt(
+    `Brightness offset for tile ${tileId} in percent (-100 to 100).\n` +
+    "Tip: leave empty to reset to 0.",
+    String(current)
+  );
+  if (answer == null) return;
+
+  const raw = String(answer).trim();
+  if (!raw) {
+    delete state.tileBrightnessOffsets[tileId];
+    renderTileDetails();
+    render();
+    saveMapAutosave();
+    setStatus(`Tile ${tileId} brightness offset reset to 0%.`);
+    return;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    setStatus("Brightness offset must be a number between -100 and 100.");
+    return;
+  }
+
+  const clamped = Math.max(-100, Math.min(100, Math.round(parsed)));
+  if (clamped === 0) {
+    delete state.tileBrightnessOffsets[tileId];
+  } else {
+    state.tileBrightnessOffsets[tileId] = clamped;
+  }
+  renderTileDetails();
+  render();
+  saveMapAutosave();
+  const sign = clamped >= 0 ? "+" : "";
+  setStatus(`Tile ${tileId} brightness offset set to ${sign}${clamped}%.`);
+}
+
 function getLayout() {
   const viewW = 980;
   const viewH = 720;
@@ -1500,6 +1605,7 @@ function animatedBackgroundColor(baseCssColor, wallX, wallY) {
 // with tile rotation applied.
 function getTilePixelRgb(tileId) {
   const rot = state.tileRotations[tileId] || 0;
+  const brightnessScale = getTileBrightnessScale(tileId);
   const grid = TILE_PIXEL_GRID;
   const pixels = Array.from({ length: LEDS_PER_TILE }, () => [16, 18, 21]);
   const tile = getTileById(tileId);
@@ -1541,7 +1647,7 @@ function getTilePixelRgb(tileId) {
       }
 
       const ledIndex = tileCoordToLedIndex(x, y);
-      pixels[ledIndex] = rgb;
+      pixels[ledIndex] = applyBrightnessToRgb(rgb, brightnessScale);
     }
   }
   return pixels;
@@ -3771,6 +3877,8 @@ function getTilePixelColors(tileId) {
     return Array.from({ length: TILE_PIXEL_GRID }, () => Array(TILE_PIXEL_GRID).fill("#101215"));
   }
 
+  const brightnessScale = getTileBrightnessScale(tileId);
+
   const out = [];
   const baseWallX = (tile.col - 1) * TILE_PIXEL_GRID;
   const baseWallY = (tile.row - 1) * TILE_PIXEL_GRID;
@@ -3784,13 +3892,14 @@ function getTilePixelColors(tileId) {
       const sourceY = state.demoOffsetY + wallY;
       const animated = getAnimatedPixelColorAtWall(wallX, wallY);
       const baseColor = getPixelColorAtSource(sourceX, sourceY);
-      row.push(
-        animated || (
-          state.animation.active
-            ? animatedBackgroundColor(baseColor, wallX, wallY)
-            : baseColor
-        )
+      const cssColor = animated || (
+        state.animation.active
+          ? animatedBackgroundColor(baseColor, wallX, wallY)
+          : baseColor
       );
+      const rgb = cssColorToRgb(cssColor);
+      const [r, g, b] = applyBrightnessToRgb(rgb, brightnessScale);
+      row.push(`rgb(${r}, ${g}, ${b})`);
     }
     out.push(row);
   }
@@ -4018,6 +4127,11 @@ function renderTileDetails() {
 
   const rot = state.tileRotations[tile.id] || 0;
   details.push(`rotation: ${rot}°`);
+  details.push(`mapped brightness: ${clampBrightnessPercent(state.mappedBrightness, 100)}%`);
+  details.push(`tile brightness offset: ${getTileBrightnessOffset(tile.id)}%`);
+  if (isTileMapped(tile.id)) {
+    details.push(`effective mapped brightness: ${Math.round(getTileBrightnessScale(tile.id) * 100)}%`);
+  }
 
   el.tileDetails.textContent = details.join("\n");
   updateGeneralButtonStates();
@@ -4083,13 +4197,17 @@ function buildExportPayload(includeGeneratedAt = true) {
   });
 
   return {
-    version: 4,
+    version: 5,
     generatedAt: includeGeneratedAt ? new Date().toISOString() : "preview",
     wall: {
       width: state.cols,
       height: state.rows,
       tileCount: state.tiles.length,
       expectedMasters: state.expectedMasters,
+    },
+    brightness: {
+      mappedPercent: clampBrightnessPercent(state.mappedBrightness, 100),
+      tileOffsets: { ...state.tileBrightnessOffsets },
     },
     masters,
     tiles,
@@ -4162,9 +4280,23 @@ async function importData(data) {
   state.twinklyRtModeAt = {};
   state.twinklyRtFrameFormat = {};
   state.tileRotations = {};
+  state.tileBrightnessOffsets = {};
+  state.mappedBrightness = clampBrightnessPercent(data?.brightness?.mappedPercent, 100);
   state.wizard.lockedTiles = {};
   state.wizard.assignments = [];
   state.wizard.segmentTileIds = {};
+
+  if (data?.brightness?.tileOffsets && typeof data.brightness.tileOffsets === "object") {
+    for (const [k, v] of Object.entries(data.brightness.tileOffsets)) {
+      const tileId = Number(k);
+      if (!Number.isInteger(tileId)) continue;
+      const offset = Number(v);
+      if (!Number.isFinite(offset)) continue;
+      const clamped = Math.max(-100, Math.min(100, Math.round(offset)));
+      if (clamped !== 0) state.tileBrightnessOffsets[tileId] = clamped;
+    }
+  }
+  syncMappedBrightnessControls();
 
   const masterIpById = new Map();
   for (const m of data.masters) {
@@ -4456,6 +4588,9 @@ function resetAll() {
   state.masterIPs = {};
   state.masterLeds = {};
   state.tileRotations = {};
+  state.tileBrightnessOffsets = {};
+  state.mappedBrightness = 100;
+  syncMappedBrightnessControls();
   state.discoveredDevices = [];
   state.wizard = {
     active: false,
@@ -6281,6 +6416,17 @@ function bindEvents() {
   el.colsInput.addEventListener("input", updateGeneralButtonStates);
   el.mastersInput.addEventListener("input", updateGeneralButtonStates);
 
+  if (el.mappedBrightnessRange) {
+    el.mappedBrightnessRange.addEventListener("input", () => {
+      setMappedBrightness(el.mappedBrightnessRange.value);
+    });
+  }
+  if (el.mappedBrightnessNumber) {
+    el.mappedBrightnessNumber.addEventListener("change", () => {
+      setMappedBrightness(el.mappedBrightnessNumber.value);
+    });
+  }
+
   el.masterIpInput.addEventListener("change", () => {
     const tile = getTileById(state.selectedTileId);
     if (!tile || !tile.isMaster) return;
@@ -6587,6 +6733,11 @@ function bindEvents() {
   if (el.btnCtxRotateTileRight) {
     el.btnCtxRotateTileRight.addEventListener("click", () => {
       rotateTileFromContextMenu(90);
+    });
+  }
+  if (el.btnCtxTileBrightness) {
+    el.btnCtxTileBrightness.addEventListener("click", () => {
+      setTileBrightnessOffsetFromContextMenu();
     });
   }
   if (el.btnCtxUnmapTile) {
@@ -7039,6 +7190,10 @@ function buildMapSnapshot() {
     rows: state.rows,
     cols: state.cols,
     expectedMasters: state.expectedMasters,
+    brightness: {
+      mappedPercent: clampBrightnessPercent(state.mappedBrightness, 100),
+      tileOffsets: { ...state.tileBrightnessOffsets },
+    },
     masters: state.tiles
       .filter((t) => t.isMaster)
       .map((t) => ({
@@ -7200,6 +7355,19 @@ function applyMapSnapshot(d) {
   state.masterIPs = {};
   state.masterLeds = {};
   state.tileRotations = {};
+  state.tileBrightnessOffsets = {};
+  state.mappedBrightness = clampBrightnessPercent(d?.brightness?.mappedPercent, 100);
+  if (d?.brightness?.tileOffsets && typeof d.brightness.tileOffsets === "object") {
+    for (const [k, v] of Object.entries(d.brightness.tileOffsets)) {
+      const tileId = Number(k);
+      if (!Number.isInteger(tileId)) continue;
+      const offset = Number(v);
+      if (!Number.isFinite(offset)) continue;
+      const clamped = Math.max(-100, Math.min(100, Math.round(offset)));
+      if (clamped !== 0) state.tileBrightnessOffsets[tileId] = clamped;
+    }
+  }
+  syncMappedBrightnessControls();
   state.wizard.selectedIp = String(d.wizard?.selectedIp || "");
   state.wizard.scanSubnet = normalizeScanSubnetScope(d.wizard?.scanSubnet || "") || "";
   if (el.wizardScanSubnet) el.wizardScanSubnet.value = state.wizard.scanSubnet;
@@ -7518,6 +7686,7 @@ async function init() {
   renderDetectStrictnessUI();
   closeDetectModal();
   switchView("map");
+  syncMappedBrightnessControls();
   renderActionSelect();
   renderActionTimeline();
   renderCharacterSearchResults();
