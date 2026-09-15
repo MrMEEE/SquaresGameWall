@@ -1371,7 +1371,7 @@ function getMirrorPayloadSignature(masters) {
   });
 }
 
-function withAnimationFrameSnapshot(frameIndex, fn) {
+function withAnimationFrameSnapshot(frameIndex, fn, elapsedMs = null) {
   const anim = state.animation;
   const prev = {
     frameIndex: anim.frameIndex,
@@ -1381,8 +1381,16 @@ function withAnimationFrameSnapshot(frameIndex, fn) {
   };
 
   if (anim.active && anim.frames.length) {
-    anim.frameIndex = frameIndex % anim.frames.length;
-    anim.frameTimerMs = 0;
+    const durationMs = Math.max(40, Number(anim.frameDurationMs) || 120);
+    if (Number.isFinite(elapsedMs) && elapsedMs >= 0) {
+      const total = anim.frames.length;
+      const timelineIndex = Math.floor(elapsedMs / durationMs) % total;
+      anim.frameIndex = ((timelineIndex % total) + total) % total;
+      anim.frameTimerMs = elapsedMs % durationMs;
+    } else {
+      anim.frameIndex = frameIndex % anim.frames.length;
+      anim.frameTimerMs = 0;
+    }
     const frame = anim.frames[anim.frameIndex];
     const bob = anim.frameIndex % 2 === 0 ? 0 : -1;
     anim.posX = Math.floor((wallPixelWidth() - frame.width) / 2);
@@ -1399,15 +1407,27 @@ function withAnimationFrameSnapshot(frameIndex, fn) {
 }
 
 function buildServerMirrorPayload(masters) {
-  const frameCount = state.animation.active && state.animation.frames.length
-    ? Math.max(1, state.animation.frames.length)
+  const maxLeds = masters.reduce((acc, masterId) => {
+    const ip = state.masterIPs[masterId];
+    if (!ip) return acc;
+    return Math.max(acc, estimateMasterLedCount(masterId, ip));
+  }, 0);
+
+  const targetFps = maxLeds > 4096 ? 12 : (maxLeds > 2048 ? 20 : 30);
+  const animFrames = state.animation.frames.length;
+  const animActive = state.animation.active && animFrames > 0;
+  const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
+  const cycleMs = animActive ? (durationMs * animFrames) : 1000;
+  const frameCount = animActive
+    ? Math.max(animFrames, Math.min(90, Math.round((cycleMs / 1000) * targetFps)))
     : 1;
-  const fps = state.animation.active
-    ? Math.max(1, Math.min(60, Math.round(1000 / Math.max(40, Number(state.animation.frameDurationMs) || 120))))
+  const fps = animActive
+    ? Math.max(1, Math.min(60, Math.round(frameCount / (cycleMs / 1000))))
     : 12;
 
   const frames = [];
   for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
+    const elapsedMs = animActive ? ((frameIndex / frameCount) * cycleMs) : null;
     const packed = withAnimationFrameSnapshot(frameIndex, () => {
       const tileRgbCache = new Map();
       const neededTileIds = new Set();
@@ -1432,7 +1452,7 @@ function buildServerMirrorPayload(masters) {
         });
       }
       return mastersPayload;
-    });
+    }, elapsedMs);
     if (packed.length) {
       frames.push({ masters: packed });
     }
@@ -1463,7 +1483,7 @@ async function syncServerMirrorPlayback(force = false) {
 
   const signature = getMirrorPayloadSignature(masters);
   const now = Date.now();
-  if (!force && signature === state.serverMirrorLastHash && (now - state.serverMirrorLastAt) < 3000) {
+  if (!force && signature === state.serverMirrorLastHash) {
     return false;
   }
 
@@ -2530,7 +2550,7 @@ function maybeAutoSyncHardwareFromVirtualMap() {
   }
 
   const now = Date.now();
-  if (autoHardwarePushInFlight || (now - autoHardwarePushLastMs) < 250) return;
+  if (autoHardwarePushInFlight || (now - autoHardwarePushLastMs) < 500) return;
   autoHardwarePushLastMs = now;
   autoHardwarePushInFlight = true;
 

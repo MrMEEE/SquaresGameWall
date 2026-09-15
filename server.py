@@ -29,6 +29,89 @@ CHARACTERS_ROOT = WORKSPACE_ROOT / "characters"
 
 
 class MirrorRuntime:
+    class _MasterWorker:
+        def __init__(self, runtime, ip):
+            self.runtime = runtime
+            self.ip = ip
+            self._lock = threading.Lock()
+            self._event = threading.Event()
+            self._stop_event = threading.Event()
+            self._pending = None
+            self._thread = None
+            self.push_ok = 0
+            self.push_err = 0
+            self.last_push_at = ""
+            self.last_error = ""
+
+        def start(self):
+            if self._thread and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+        def stop(self, join_timeout=1.0):
+            self._stop_event.set()
+            self._event.set()
+            thread = self._thread
+            self._thread = None
+            if thread:
+                thread.join(timeout=join_timeout)
+
+        def submit(self, frame_bytes):
+            if not isinstance(frame_bytes, (bytes, bytearray)) or len(frame_bytes) < 3:
+                return
+            with self._lock:
+                # Latest-frame wins: overwrite stale pending frame to avoid queue lag.
+                self._pending = bytes(frame_bytes)
+            self._event.set()
+
+        def snapshot(self):
+            with self._lock:
+                return {
+                    "ip": self.ip,
+                    "pushOk": self.push_ok,
+                    "pushErr": self.push_err,
+                    "lastPushAt": self.last_push_at,
+                    "lastError": self.last_error,
+                }
+
+        def _take_pending(self):
+            with self._lock:
+                payload = self._pending
+                self._pending = None
+                return payload
+
+        def _record_ok(self):
+            stamp = _now_iso()
+            with self._lock:
+                self.push_ok += 1
+                self.last_push_at = stamp
+                self.last_error = ""
+            self.runtime._record_push(stamp)
+
+        def _record_err(self, message):
+            with self._lock:
+                self.push_err += 1
+                self.last_error = message
+            self.runtime._record_error(message)
+
+        def _run(self):
+            while not self._stop_event.is_set():
+                self._event.wait(timeout=0.5)
+                self._event.clear()
+                if self._stop_event.is_set():
+                    return
+
+                frame_bytes = self._take_pending()
+                if not frame_bytes:
+                    continue
+
+                try:
+                    self.runtime._push_rt_frame(self.ip, frame_bytes)
+                    self._record_ok()
+                except Exception as exc:
+                    self._record_err(str(exc))
+
     def __init__(self):
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -37,6 +120,7 @@ class MirrorRuntime:
         self._fps = 20
         self._frames = []
         self._frame_index = 0
+        self._workers = {}
         self._tokens = {}
         self._rt_mode_at = {}
         self._rt_frame_format = {}
@@ -47,11 +131,13 @@ class MirrorRuntime:
 
     def status(self):
         with self._lock:
+            worker_snaps = {ip: w.snapshot() for ip, w in self._workers.items()}
             return {
                 "running": self._running,
                 "fps": self._fps,
                 "frames": len(self._frames),
                 "frameIndex": self._frame_index,
+                "workers": worker_snaps,
                 "lastPushAt": self._last_push_at,
                 "lastError": self._last_error,
                 "pushOk": self._push_ok,
@@ -64,6 +150,7 @@ class MirrorRuntime:
             raise ValueError("frames must be a non-empty list")
 
         normalized = []
+        active_ips = set()
         for item in frames:
             masters = item.get("masters") if isinstance(item, dict) else None
             if not isinstance(masters, list) or not masters:
@@ -75,6 +162,7 @@ class MirrorRuntime:
                 if not ip or not isinstance(data, (bytes, bytearray)) or len(data) < 3:
                     continue
                 packed.append({"ip": ip, "frameBytes": bytes(data)})
+                active_ips.add(ip)
             if packed:
                 normalized.append({"masters": packed})
 
@@ -82,18 +170,41 @@ class MirrorRuntime:
             raise ValueError("no valid frames to run")
 
         self.stop(join_timeout=1.5)
+        workers_to_stop = []
         with self._lock:
             self._frames = normalized
             self._fps = safe_fps
             self._frame_index = 0
             self._last_error = ""
+            self._last_push_at = ""
+            self._push_ok = 0
+            self._push_err = 0
+
+            current_ips = set(self._workers.keys())
+            for ip in (current_ips - active_ips):
+                worker = self._workers.pop(ip, None)
+                if worker:
+                    workers_to_stop.append(worker)
+                self._tokens.pop(ip, None)
+                self._rt_mode_at.pop(ip, None)
+                self._rt_frame_format.pop(ip, None)
+
+            for ip in (active_ips - current_ips):
+                worker = MirrorRuntime._MasterWorker(self, ip)
+                self._workers[ip] = worker
+                worker.start()
+
             self._stop_event = threading.Event()
             self._running = True
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
 
+        for worker in workers_to_stop:
+            worker.stop(join_timeout=1.0)
+
     def stop(self, join_timeout=1.0):
         thread = None
+        workers = []
         with self._lock:
             if not self._running:
                 return
@@ -101,8 +212,12 @@ class MirrorRuntime:
             self._stop_event.set()
             thread = self._thread
             self._thread = None
+            workers = list(self._workers.values())
+            self._workers = {}
         if thread:
             thread.join(timeout=join_timeout)
+        for worker in workers:
+            worker.stop(join_timeout=join_timeout)
 
     def _run(self):
         while True:
@@ -114,6 +229,7 @@ class MirrorRuntime:
                 idx = self._frame_index % len(frames)
                 frame = frames[idx]
                 self._frame_index = (idx + 1) % len(frames)
+                workers = dict(self._workers)
 
             started = time.perf_counter()
             for master in frame.get("masters", []):
@@ -121,21 +237,25 @@ class MirrorRuntime:
                 frame_bytes = master.get("frameBytes")
                 if not ip or not frame_bytes:
                     continue
-                try:
-                    self._push_rt_frame(ip, frame_bytes)
-                    with self._lock:
-                        self._push_ok += 1
-                        self._last_push_at = _now_iso()
-                except Exception as exc:
-                    with self._lock:
-                        self._push_err += 1
-                        self._last_error = str(exc)
+                worker = workers.get(ip)
+                if worker:
+                    worker.submit(frame_bytes)
 
             interval = 1.0 / max(1, fps)
             elapsed = time.perf_counter() - started
             sleep_s = max(0.0, interval - elapsed)
             if self._stop_event.wait(sleep_s):
                 return
+
+    def _record_push(self, stamp):
+        with self._lock:
+            self._push_ok += 1
+            self._last_push_at = stamp
+
+    def _record_error(self, message):
+        with self._lock:
+            self._push_err += 1
+            self._last_error = str(message)
 
     def _twinkly_fetch(self, ip, path, method="GET", body=None, headers=None, timeout=8):
         url = f"http://{ip}{path}"
