@@ -38,6 +38,9 @@ class MirrorRuntime:
             self._stop_event = threading.Event()
             self._pending = None
             self._thread = None
+            self._target_fps = 20.0
+            self._min_interval_s = 1.0 / 20.0
+            self._next_allowed_at = 0.0
             self.push_ok = 0
             self.push_err = 0
             self.last_push_at = ""
@@ -69,10 +72,21 @@ class MirrorRuntime:
                 }
             self._event.set()
 
+        def set_target_fps(self, fps):
+            try:
+                value = float(fps)
+            except Exception:
+                value = 20.0
+            value = max(1.0, min(60.0, value))
+            with self._lock:
+                self._target_fps = value
+                self._min_interval_s = 1.0 / value
+
         def snapshot(self):
             with self._lock:
                 return {
                     "ip": self.ip,
+                    "targetFps": round(self._target_fps, 2),
                     "pushOk": self.push_ok,
                     "pushErr": self.push_err,
                     "lastPushAt": self.last_push_at,
@@ -84,12 +98,6 @@ class MirrorRuntime:
                 payload = self._pending
                 self._pending = None
                 return payload
-
-        def _has_newer_pending(self, frame_seq):
-            with self._lock:
-                if self._pending is None:
-                    return False
-                return int(self._pending.get("frameSeq", -1)) > int(frame_seq)
 
         def _record_ok(self):
             stamp = _now_iso()
@@ -117,7 +125,6 @@ class MirrorRuntime:
                     continue
 
                 target_at = pending.get("targetAt")
-                frame_seq = int(pending.get("frameSeq", 0))
                 if target_at is not None:
                     while True:
                         if self._stop_event.is_set():
@@ -125,19 +132,32 @@ class MirrorRuntime:
                         wait_s = target_at - time.perf_counter()
                         if wait_s <= 0:
                             break
-                        if self._has_newer_pending(frame_seq):
-                            pending = None
-                            break
-                        self._stop_event.wait(min(wait_s, 0.005))
+                        self._stop_event.wait(min(wait_s, 0.002))
                         if self._stop_event.is_set():
                             return
-                if not pending:
-                    continue
-                if self._has_newer_pending(frame_seq):
-                    continue
+
+                # If a newer frame arrived while waiting for the sync target,
+                # swap to it immediately rather than dropping this cycle.
+                latest = self._take_pending()
+                if latest:
+                    pending = latest
+
+                while True:
+                    with self._lock:
+                        wait_s = self._next_allowed_at - time.perf_counter()
+                    if wait_s <= 0:
+                        break
+                    self._stop_event.wait(min(wait_s, 0.002))
+                    if self._stop_event.is_set():
+                        return
+                    latest = self._take_pending()
+                    if latest:
+                        pending = latest
 
                 try:
                     self.runtime._push_rt_frame(self.ip, pending["frameBytes"])
+                    with self._lock:
+                        self._next_allowed_at = time.perf_counter() + self._min_interval_s
                     self._record_ok()
                 except Exception as exc:
                     self._record_err(str(exc))
@@ -158,7 +178,7 @@ class MirrorRuntime:
         self._last_error = ""
         self._push_ok = 0
         self._push_err = 0
-        self._dispatch_lead_s = 0.020
+        self._dispatch_lead_s = 0.012
         self._dispatch_seq = 0
 
     def status(self):
@@ -169,12 +189,41 @@ class MirrorRuntime:
                 "fps": self._fps,
                 "frames": len(self._frames),
                 "frameIndex": self._frame_index,
+                "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
                 "workers": worker_snaps,
                 "lastPushAt": self._last_push_at,
                 "lastError": self._last_error,
                 "pushOk": self._push_ok,
                 "pushErr": self._push_err,
             }
+
+    def set_tuning(self, dispatch_lead_ms=None):
+        if dispatch_lead_ms is None:
+            return
+        lead = int(dispatch_lead_ms)
+        lead = max(0, min(30, lead))
+        with self._lock:
+            self._dispatch_lead_s = lead / 1000.0
+
+    def _probe_target_fps(self, ip, fallback_fps):
+        target = float(max(1, min(60, int(fallback_fps or 20))))
+        try:
+            status, raw, _headers = self._twinkly_fetch(
+                ip,
+                "/xled/v1/gestalt",
+                method="GET",
+                timeout=4,
+            )
+            if status < 200 or status >= 300:
+                return target
+            payload = json.loads(raw.decode("utf-8") or "{}")
+            measured = payload.get("measured_frame_rate", payload.get("frame_rate"))
+            measured_fps = float(measured)
+            if measured_fps <= 0:
+                return target
+            return min(target, max(1.0, min(60.0, measured_fps)))
+        except Exception:
+            return target
 
     def start(self, frames, fps=20):
         safe_fps = max(1, min(60, int(fps or 20)))
@@ -201,6 +250,8 @@ class MirrorRuntime:
         if not normalized:
             raise ValueError("no valid frames to run")
 
+        worker_fps = {ip: self._probe_target_fps(ip, safe_fps) for ip in active_ips}
+
         self.stop(join_timeout=1.5)
         workers_to_stop = []
         with self._lock:
@@ -224,8 +275,14 @@ class MirrorRuntime:
 
             for ip in (active_ips - current_ips):
                 worker = MirrorRuntime._MasterWorker(self, ip)
+                worker.set_target_fps(worker_fps.get(ip, safe_fps))
                 self._workers[ip] = worker
                 worker.start()
+
+            for ip in (active_ips & current_ips):
+                worker = self._workers.get(ip)
+                if worker:
+                    worker.set_target_fps(worker_fps.get(ip, safe_fps))
 
             self._stop_event = threading.Event()
             self._running = True
@@ -476,6 +533,10 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
             self._handle_mirror_start(body)
+        elif parsed.path == "/api/mirror/tuning":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            self._handle_mirror_tuning(body)
         elif parsed.path == "/api/mirror/stop":
             MIRROR_RUNTIME.stop()
             self._json_response(200, {"ok": True, "status": MIRROR_RUNTIME.status()})
@@ -1107,6 +1168,7 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             return
 
         fps = payload.get("fps", 20)
+        dispatch_lead_ms = payload.get("dispatchLeadMs", None)
         frames = payload.get("frames") if isinstance(payload, dict) else None
         if not isinstance(frames, list) or not frames:
             self._json_response(400, {"error": "frames[] is required"})
@@ -1139,11 +1201,27 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             return
 
         try:
+            MIRROR_RUNTIME.set_tuning(dispatch_lead_ms=dispatch_lead_ms)
             MIRROR_RUNTIME.start(parsed_frames, fps=fps)
         except Exception as exc:
             self._json_response(400, {"error": str(exc)})
             return
 
+        self._json_response(200, {"ok": True, "status": MIRROR_RUNTIME.status()})
+
+    def _handle_mirror_tuning(self, body):
+        try:
+            payload = self._read_json_body(body)
+        except Exception as exc:
+            self._json_response(400, {"error": str(exc)})
+            return
+
+        dispatch_lead_ms = payload.get("dispatchLeadMs", None) if isinstance(payload, dict) else None
+        try:
+            MIRROR_RUNTIME.set_tuning(dispatch_lead_ms=dispatch_lead_ms)
+        except Exception as exc:
+            self._json_response(400, {"error": str(exc)})
+            return
         self._json_response(200, {"ok": True, "status": MIRROR_RUNTIME.status()})
 
     def _handle_webproxy(self, query_string):

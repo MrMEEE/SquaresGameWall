@@ -87,6 +87,8 @@ const state = {
   livePushActive: false,
   livePushInFlight: false,
   outputEnabled: true,
+  mapOutputTransitionInFlight: false,
+  serverSyncLeadMs: 12,
   serverMirrorEnabled: true,
   serverMirrorSyncInFlight: false,
   serverMirrorLastHash: "",
@@ -264,6 +266,8 @@ const el = {
   colsInput: document.getElementById("colsInput"),
   mastersInput: document.getElementById("mastersInput"),
   btnMapPowerToggle: document.getElementById("btnMapPowerToggle"),
+  syncLeadRange: document.getElementById("syncLeadRange"),
+  syncLeadNumber: document.getElementById("syncLeadNumber"),
   mappedBrightnessRange: document.getElementById("mappedBrightnessRange"),
   mappedBrightnessNumber: document.getElementById("mappedBrightnessNumber"),
   btnResize: document.getElementById("btnResize"),
@@ -1358,6 +1362,7 @@ function getMirrorPayloadSignature(masters) {
     })),
     rotations: state.tileRotations,
     mappedBrightness: state.mappedBrightness,
+    serverSyncLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
     tileBrightnessOffsets: state.tileBrightnessOffsets,
     demoOffsetX: state.demoOffsetX,
     demoOffsetY: state.demoOffsetY,
@@ -1415,7 +1420,7 @@ function buildServerMirrorPayload(masters) {
     return Math.max(acc, estimateMasterLedCount(masterId, ip));
   }, 0);
 
-  const targetFps = maxLeds > 4096 ? 12 : (maxLeds > 2048 ? 20 : 30);
+  const targetFps = maxLeds > 4096 ? 16 : (maxLeds > 2048 ? 24 : 30);
   const animFrames = state.animation.frames.length;
   const animActive = state.animation.active && animFrames > 0;
   const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
@@ -1460,7 +1465,11 @@ function buildServerMirrorPayload(masters) {
     }
   }
 
-  return { fps, frames };
+  return {
+    fps,
+    dispatchLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
+    frames,
+  };
 }
 
 async function stopServerMirrorPlayback() {
@@ -1539,6 +1548,14 @@ function setMappedBrightness(value) {
 
 function updateMapPowerButtonState() {
   if (!el.btnMapPowerToggle) return;
+  if (state.mapOutputTransitionInFlight) {
+    el.btnMapPowerToggle.textContent = state.outputEnabled ? "Switching OFF..." : "Switching ON...";
+    el.btnMapPowerToggle.disabled = true;
+    el.btnMapPowerToggle.classList.add("secondary");
+    el.btnMapPowerToggle.classList.remove("danger");
+    return;
+  }
+  el.btnMapPowerToggle.disabled = false;
   if (state.outputEnabled) {
     el.btnMapPowerToggle.textContent = "Output: ON";
     el.btnMapPowerToggle.classList.add("danger");
@@ -1548,6 +1565,46 @@ function updateMapPowerButtonState() {
     el.btnMapPowerToggle.classList.remove("danger");
     el.btnMapPowerToggle.classList.add("secondary");
   }
+}
+
+function clampSyncLeadMs(value, fallback = 12) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(30, Math.round(n)));
+}
+
+function syncSyncLeadControls() {
+  const value = clampSyncLeadMs(state.serverSyncLeadMs, 12);
+  state.serverSyncLeadMs = value;
+  if (el.syncLeadRange) el.syncLeadRange.value = String(value);
+  if (el.syncLeadNumber) el.syncLeadNumber.value = String(value);
+}
+
+async function applyServerMirrorTuning() {
+  if (!state.serverMirrorEnabled) return;
+  try {
+    await fetch("/api/mirror/tuning", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dispatchLeadMs: state.serverSyncLeadMs }),
+      cache: "no-store",
+    });
+  } catch (_e) {
+    // Best effort; tuning is also sent on next /api/mirror/start.
+  }
+}
+
+function setServerSyncLeadMs(value) {
+  const next = clampSyncLeadMs(value, 12);
+  if (next === state.serverSyncLeadMs) {
+    syncSyncLeadControls();
+    return;
+  }
+  state.serverSyncLeadMs = next;
+  syncSyncLeadControls();
+  saveMapAutosave();
+  applyServerMirrorTuning();
+  setStatus(`Sync lead set to ${next}ms.`);
 }
 
 async function pushMasterBlack(masterId) {
@@ -1576,51 +1633,65 @@ async function pushMasterBlack(masterId) {
 }
 
 async function setMapOutputEnabled(enabled) {
+  if (state.mapOutputTransitionInFlight) {
+    updateMapPowerButtonState();
+    return;
+  }
+
   const next = Boolean(enabled);
   if (next === state.outputEnabled) {
     updateMapPowerButtonState();
     return;
   }
 
-  if (!next) {
-    if (state.livePushActive) stopLivePush();
-    state.outputEnabled = false;
-    updateMapPowerButtonState();
-    await stopServerMirrorPlayback();
+  state.mapOutputTransitionInFlight = true;
+  updateMapPowerButtonState();
 
-    const masters = Object.keys(state.masterIPs || {})
-      .map((k) => Number(k))
-      .filter((id) => Number.isInteger(id) && Boolean(getTileById(id)));
-    const errors = [];
-    await Promise.all(masters.map((masterId) =>
-      pushMasterBlack(masterId).catch((err) => {
-        const ip = state.masterIPs[masterId];
-        errors.push(`${ip}: ${err.message}`);
-      })
-    ));
-    if (errors.length) {
-      setPushStatus(`Output OFF requested, but some masters failed: ${errors.join(" | ")}`);
-      setStatus(`Output OFF requested with ${errors.length} error(s).`);
+  try {
+    if (!next) {
+      if (state.livePushActive) stopLivePush();
+      state.outputEnabled = false;
+      updateMapPowerButtonState();
+      await stopServerMirrorPlayback();
+
+      const masters = Object.keys(state.masterIPs || {})
+        .map((k) => Number(k))
+        .filter((id) => Number.isInteger(id) && Boolean(getTileById(id)));
+      const errors = [];
+      await Promise.all(masters.map((masterId) =>
+        pushMasterBlack(masterId).catch((err) => {
+          const ip = state.masterIPs[masterId];
+          errors.push(`${ip}: ${err.message}`);
+        })
+      ));
+      if (errors.length) {
+        setPushStatus(`Output OFF requested, but some masters failed: ${errors.join(" | ")}`);
+        setStatus(`Output OFF requested with ${errors.length} error(s).`);
+        return;
+      }
+      setPushStatus("Output OFF: all configured masters set to black frame.");
+      setStatus("Map output disabled.");
       return;
     }
-    setPushStatus("Output OFF: all configured masters set to black frame.");
-    setStatus("Map output disabled.");
-    return;
-  }
 
-  state.outputEnabled = true;
-  updateMapPowerButtonState();
-  try {
-    const started = await syncServerMirrorPlayback(true);
-    if (started) {
-      setPushStatus("Output ON: server-side mirror resumed.");
-    } else {
+    state.outputEnabled = true;
+    updateMapPowerButtonState();
+    try {
+      const started = await syncServerMirrorPlayback(true);
+      if (started) {
+        setPushStatus("Output ON: server-side mirror resumed.");
+      } else {
+        await pushAllTilesToHardware({ quiet: false });
+      }
+    } catch (_e) {
       await pushAllTilesToHardware({ quiet: false });
     }
-  } catch (_e) {
-    await pushAllTilesToHardware({ quiet: false });
+    setStatus("Map output enabled.");
+  } finally {
+    state.mapOutputTransitionInFlight = false;
+    updateMapPowerButtonState();
+    updateGeneralButtonStates();
   }
-  setStatus("Map output enabled.");
 }
 
 function showTileContextMenu(tileId, clientX, clientY) {
@@ -2375,6 +2446,9 @@ function updateGeneralButtonStates() {
   if (el.btnToggleLivePush) {
     el.btnToggleLivePush.disabled = !state.livePushActive && mastersWithIp === 0;
   }
+  if (el.btnMapPowerToggle) {
+    el.btnMapPowerToggle.disabled = Boolean(state.mapOutputTransitionInFlight);
+  }
 
   if (el.btnResize) {
     const rows = Number(el.rowsInput?.value);
@@ -2618,6 +2692,7 @@ function postMirrorError(message, details = null, minIntervalMs = 2500) {
 
 function maybeAutoSyncHardwareFromVirtualMap() {
   if (!state.outputEnabled) return;
+  if (state.mapOutputTransitionInFlight) return;
   if (state.wizard.active) return;
   if (state.livePushActive) return;
 
@@ -6805,6 +6880,16 @@ function bindEvents() {
       setMappedBrightness(el.mappedBrightnessNumber.value);
     });
   }
+  if (el.syncLeadRange) {
+    el.syncLeadRange.addEventListener("input", () => {
+      setServerSyncLeadMs(el.syncLeadRange.value);
+    });
+  }
+  if (el.syncLeadNumber) {
+    el.syncLeadNumber.addEventListener("change", () => {
+      setServerSyncLeadMs(el.syncLeadNumber.value);
+    });
+  }
 
   el.masterIpInput.addEventListener("change", () => {
     const tile = getTileById(state.selectedTileId);
@@ -7573,6 +7658,9 @@ function buildMapSnapshot() {
       mappedPercent: clampBrightnessPercent(state.mappedBrightness, 100),
       tileOffsets: { ...state.tileBrightnessOffsets },
     },
+    mirror: {
+      syncLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
+    },
     masters: state.tiles
       .filter((t) => t.isMaster)
       .map((t) => ({
@@ -7736,6 +7824,7 @@ function applyMapSnapshot(d) {
   state.tileRotations = {};
   state.tileBrightnessOffsets = {};
   state.mappedBrightness = clampBrightnessPercent(d?.brightness?.mappedPercent, 100);
+  state.serverSyncLeadMs = clampSyncLeadMs(d?.mirror?.syncLeadMs, 12);
   if (d?.brightness?.tileOffsets && typeof d.brightness.tileOffsets === "object") {
     for (const [k, v] of Object.entries(d.brightness.tileOffsets)) {
       const tileId = Number(k);
@@ -7747,6 +7836,7 @@ function applyMapSnapshot(d) {
     }
   }
   syncMappedBrightnessControls();
+  syncSyncLeadControls();
   state.wizard.selectedIp = String(d.wizard?.selectedIp || "");
   state.wizard.scanSubnet = normalizeScanSubnetScope(d.wizard?.scanSubnet || "") || "";
   if (el.wizardScanSubnet) el.wizardScanSubnet.value = state.wizard.scanSubnet;
@@ -8066,6 +8156,7 @@ async function init() {
   closeDetectModal();
   switchView("map");
   syncMappedBrightnessControls();
+  syncSyncLeadControls();
   updateMapPowerButtonState();
   renderActionSelect();
   renderActionTimeline();
