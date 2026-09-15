@@ -85,6 +85,11 @@ const state = {
   twinklyRtModeAt: {},
   twinklyRtFrameFormat: {},
   livePushActive: false,
+  livePushInFlight: false,
+  serverMirrorEnabled: true,
+  serverMirrorSyncInFlight: false,
+  serverMirrorLastHash: "",
+  serverMirrorLastAt: 0,
   livePushRafId: null,
   discoveredDevices: [],
   wizard: {
@@ -1250,6 +1255,246 @@ function applyBrightnessToRgb(rgb, scale) {
   return out;
 }
 
+function bytesToBase64(bytes) {
+  let out = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    out += String.fromCharCode(...chunk);
+  }
+  return btoa(out);
+}
+
+function estimateMasterLedCount(masterId, ip) {
+  let requiredLeds = Number(state.masterLeds[masterId] || 0);
+  if (!Number.isInteger(requiredLeds) || requiredLeds < LEDS_PER_TILE) {
+    requiredLeds = LEDS_PER_TILE;
+  }
+  for (const item of state.wizard.assignments || []) {
+    if (item.ip !== ip) continue;
+    const g = Number(item.ledGroup);
+    if (!Number.isInteger(g) || g < 1) continue;
+    const endLed = g * LEDS_PER_TILE;
+    if (endLed > requiredLeds) requiredLeds = endLed;
+  }
+  return requiredLeds;
+}
+
+function buildMasterFrameBytes(masterId, ip, totalLeds, tileRgbCache = null) {
+  const chain = getOrderedTilesForMaster(masterId);
+  const tileGroupById = new Map();
+  for (const item of state.wizard.assignments || []) {
+    if (item.ip !== ip) continue;
+    if (!Number.isInteger(item.tileId)) continue;
+    const g = Number(item.ledGroup);
+    if (!Number.isInteger(g) || g < 1) continue;
+    tileGroupById.set(item.tileId, g);
+  }
+  const hasMappedGroups = tileGroupById.size > 0;
+  if (!tileGroupById.has(masterId)) {
+    tileGroupById.set(masterId, 1);
+  }
+
+  const deviceLeds = Number(totalLeds || 0);
+  let requiredLeds = deviceLeds;
+  for (const tileId of chain) {
+    const group = tileGroupById.get(tileId);
+    if (!Number.isInteger(group) || group < 1) continue;
+    const endLed = group * LEDS_PER_TILE;
+    if (endLed > requiredLeds) requiredLeds = endLed;
+  }
+  if (!Number.isFinite(requiredLeds) || requiredLeds < LEDS_PER_TILE) {
+    requiredLeds = LEDS_PER_TILE;
+  }
+  if (Number.isFinite(deviceLeds) && deviceLeds > 0) {
+    requiredLeds = Math.min(requiredLeds, deviceLeds);
+  }
+
+  const frameBytes = new Uint8Array(requiredLeds * 3);
+  if (!hasMappedGroups) {
+    const slotCount = Math.max(1, Math.floor(requiredLeds / LEDS_PER_TILE));
+    for (let slot = 0; slot < slotCount; slot += 1) {
+      const tileId = chain[slot % chain.length] || masterId;
+      const pixels = tileRgbCache?.get(tileId) || getTilePixelRgb(tileId);
+      const base = slot * LEDS_PER_TILE * 3;
+      pixels.forEach(([r, g, b], pIdx) => {
+        frameBytes[base + pIdx * 3] = r;
+        frameBytes[base + pIdx * 3 + 1] = g;
+        frameBytes[base + pIdx * 3 + 2] = b;
+      });
+    }
+  } else {
+    chain.forEach((tileId, tileIdx) => {
+      const ledGroup = tileGroupById.get(tileId);
+      const slot = Number.isInteger(ledGroup) && ledGroup >= 1 ? (ledGroup - 1) : tileIdx;
+      if (slot >= requiredLeds / LEDS_PER_TILE) return;
+      const pixels = tileRgbCache?.get(tileId) || getTilePixelRgb(tileId);
+      const base = slot * LEDS_PER_TILE * 3;
+      pixels.forEach(([r, g, b], pIdx) => {
+        frameBytes[base + pIdx * 3] = r;
+        frameBytes[base + pIdx * 3 + 1] = g;
+        frameBytes[base + pIdx * 3 + 2] = b;
+      });
+    });
+  }
+
+  return {
+    frameBytes,
+    requiredLeds,
+    strategy: hasMappedGroups ? "mapped-groups" : "broadcast-slots",
+  };
+}
+
+function getMirrorPayloadSignature(masters) {
+  return JSON.stringify({
+    masters: masters.map((id) => ({ id, ip: state.masterIPs[id] || "", leds: state.masterLeds[id] || 0 })),
+    assignments: (state.wizard.assignments || []).map((a) => ({
+      ip: a.ip,
+      segment: a.segment,
+      tileId: a.tileId,
+      ledGroup: a.ledGroup,
+    })),
+    rotations: state.tileRotations,
+    mappedBrightness: state.mappedBrightness,
+    tileBrightnessOffsets: state.tileBrightnessOffsets,
+    demoOffsetX: state.demoOffsetX,
+    demoOffsetY: state.demoOffsetY,
+    anim: {
+      active: state.animation.active,
+      frameCount: state.animation.frames.length,
+      frameDurationMs: state.animation.frameDurationMs,
+      label: state.animation.label,
+    },
+    sourceFrame: state.sourceFrame
+      ? { width: state.sourceFrame.width, height: state.sourceFrame.height, label: state.sourceFrame.label }
+      : null,
+  });
+}
+
+function withAnimationFrameSnapshot(frameIndex, fn) {
+  const anim = state.animation;
+  const prev = {
+    frameIndex: anim.frameIndex,
+    frameTimerMs: anim.frameTimerMs,
+    posX: anim.posX,
+    posY: anim.posY,
+  };
+
+  if (anim.active && anim.frames.length) {
+    anim.frameIndex = frameIndex % anim.frames.length;
+    anim.frameTimerMs = 0;
+    const frame = anim.frames[anim.frameIndex];
+    const bob = anim.frameIndex % 2 === 0 ? 0 : -1;
+    anim.posX = Math.floor((wallPixelWidth() - frame.width) / 2);
+    anim.posY = Math.floor((wallPixelHeight() - frame.height) / 2) + bob;
+  }
+
+  const result = fn();
+
+  anim.frameIndex = prev.frameIndex;
+  anim.frameTimerMs = prev.frameTimerMs;
+  anim.posX = prev.posX;
+  anim.posY = prev.posY;
+  return result;
+}
+
+function buildServerMirrorPayload(masters) {
+  const frameCount = state.animation.active && state.animation.frames.length
+    ? Math.max(1, state.animation.frames.length)
+    : 1;
+  const fps = state.animation.active
+    ? Math.max(1, Math.min(60, Math.round(1000 / Math.max(40, Number(state.animation.frameDurationMs) || 120))))
+    : 12;
+
+  const frames = [];
+  for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
+    const packed = withAnimationFrameSnapshot(frameIndex, () => {
+      const tileRgbCache = new Map();
+      const neededTileIds = new Set();
+      for (const masterId of masters) {
+        for (const tileId of getOrderedTilesForMaster(masterId)) {
+          if (Number.isInteger(tileId)) neededTileIds.add(tileId);
+        }
+      }
+      for (const tileId of neededTileIds) {
+        tileRgbCache.set(tileId, getTilePixelRgb(tileId));
+      }
+
+      const mastersPayload = [];
+      for (const masterId of masters) {
+        const ip = state.masterIPs[masterId];
+        if (!ip) continue;
+        const ledCount = estimateMasterLedCount(masterId, ip);
+        const built = buildMasterFrameBytes(masterId, ip, ledCount, tileRgbCache);
+        mastersPayload.push({
+          ip,
+          frameBase64: bytesToBase64(built.frameBytes),
+        });
+      }
+      return mastersPayload;
+    });
+    if (packed.length) {
+      frames.push({ masters: packed });
+    }
+  }
+
+  return { fps, frames };
+}
+
+async function stopServerMirrorPlayback() {
+  try {
+    await fetch("/api/mirror/stop", { method: "POST" });
+  } catch (_e) {
+    // best effort
+  }
+}
+
+async function syncServerMirrorPlayback(force = false) {
+  if (!state.serverMirrorEnabled) return false;
+  if (state.serverMirrorSyncInFlight) return false;
+  const masters = Object.keys(state.masterIPs || {})
+    .map((k) => Number(k))
+    .filter((id) => Number.isInteger(id) && Boolean(getTileById(id)));
+  if (!masters.length) {
+    await stopServerMirrorPlayback();
+    state.serverMirrorLastHash = "";
+    return false;
+  }
+
+  const signature = getMirrorPayloadSignature(masters);
+  const now = Date.now();
+  if (!force && signature === state.serverMirrorLastHash && (now - state.serverMirrorLastAt) < 3000) {
+    return false;
+  }
+
+  state.serverMirrorSyncInFlight = true;
+  try {
+    const payload = buildServerMirrorPayload(masters);
+    if (!payload.frames.length) return false;
+    const res = await fetch("/api/mirror/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      let msg = `server mirror start failed (${res.status})`;
+      try {
+        const j = await res.json();
+        if (j?.error) msg = `${msg}: ${j.error}`;
+      } catch (_e) {
+        // noop
+      }
+      throw new Error(msg);
+    }
+    state.serverMirrorLastHash = signature;
+    state.serverMirrorLastAt = now;
+    return true;
+  } finally {
+    state.serverMirrorSyncInFlight = false;
+  }
+}
+
 function syncMappedBrightnessControls() {
   const value = clampBrightnessPercent(state.mappedBrightness, 100);
   state.mappedBrightness = value;
@@ -1601,6 +1846,43 @@ function animatedBackgroundColor(baseCssColor, wallX, wallY) {
   return `rgb(${clamp(r + delta)}, ${clamp(g + delta)}, ${clamp(b + delta)})`;
 }
 
+function getSourcePixelRgbAt(sourceX, sourceY) {
+  if (!state.sourceFrame) return [16, 18, 21];
+  if (sourceX < 0 || sourceY < 0 || sourceX >= state.sourceFrame.width || sourceY >= state.sourceFrame.height) {
+    return [16, 18, 21];
+  }
+
+  const i = (sourceY * state.sourceFrame.width + sourceX) * 4;
+  const data = state.sourceFrame.imageData.data;
+  const a = data[i + 3] / 255;
+  if (a <= 0) return [16, 18, 21];
+  return [data[i], data[i + 1], data[i + 2]];
+}
+
+function getAnimatedPixelRgbAtWall(wallX, wallY) {
+  const anim = state.animation;
+  if (!anim.active || anim.frames.length === 0) return null;
+
+  const frame = anim.frames[anim.frameIndex];
+  const fx = wallX - Math.round(anim.posX);
+  const fy = wallY - Math.round(anim.posY);
+  if (fx < 0 || fy < 0 || fx >= frame.width || fy >= frame.height) return null;
+
+  const i = (fy * frame.width + fx) * 4;
+  const a = frame.data[i + 3] / 255;
+  if (a < 0.1) return null;
+  return [frame.data[i], frame.data[i + 1], frame.data[i + 2]];
+}
+
+function animatedBackgroundRgb(baseRgb, wallX, wallY) {
+  const [r, g, b] = baseRgb;
+  const phase = (state.animation.frameIndex || 0) + Math.floor((state.animation.frameTimerMs || 0) / 30);
+  const stripe = ((wallX + wallY + phase) % 8) < 4 ? 1 : -1;
+  const delta = stripe * 6;
+  const clamp = (v) => Math.max(0, Math.min(255, v));
+  return [clamp(r + delta), clamp(g + delta), clamp(b + delta)];
+}
+
 // Returns a flat 64-element array of [r,g,b] triples indexed by Twinkly LED index,
 // with tile rotation applied.
 function getTilePixelRgb(tileId) {
@@ -1625,26 +1907,13 @@ function getTilePixelRgb(tileId) {
       const sourceX = state.demoOffsetX + wallX;
       const sourceY = state.demoOffsetY + wallY;
 
-      const animated = getAnimatedPixelColorAtWall(wallX, wallY);
-      const baseColor = getPixelColorAtSource(sourceX, sourceY);
-      const cssColor = animated || (
+      const animated = getAnimatedPixelRgbAtWall(wallX, wallY);
+      const baseRgb = getSourcePixelRgbAt(sourceX, sourceY);
+      const rgb = animated || (
         state.animation.active
-          ? animatedBackgroundColor(baseColor, wallX, wallY)
-          : baseColor
+          ? animatedBackgroundRgb(baseRgb, wallX, wallY)
+          : baseRgb
       );
-
-      // Parse the css color string to r,g,b
-      const m = cssColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-      let rgb;
-      if (m) {
-        rgb = [Number(m[1]), Number(m[2]), Number(m[3])];
-      } else {
-        const hex = cssColor.replace("#", "");
-        const n = parseInt(hex.length === 3
-          ? hex.split("").map((c) => c + c).join("")
-          : hex, 16) || 0x101215;
-        rgb = [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
-      }
 
       const ledIndex = tileCoordToLedIndex(x, y);
       pixels[ledIndex] = applyBrightnessToRgb(rgb, brightnessScale);
@@ -2247,6 +2516,10 @@ function maybeAutoSyncHardwareFromVirtualMap() {
     .map((k) => Number(k))
     .filter((id) => Number.isInteger(id) && Boolean(getTileById(id)));
   if (!masters.length) {
+    if (state.serverMirrorLastHash) {
+      stopServerMirrorPlayback();
+      state.serverMirrorLastHash = "";
+    }
     setAutoMirrorInfo(`Auto mirror waiting: map at least one master tile and set its IP address.${formatMirrorStatsSuffix()}`);
     postMirrorInfo("waiting-no-masters", {
       stats: state.mirrorStats,
@@ -2257,18 +2530,21 @@ function maybeAutoSyncHardwareFromVirtualMap() {
   }
 
   const now = Date.now();
-  if (autoHardwarePushInFlight || (now - autoHardwarePushLastMs) < 80) return;
+  if (autoHardwarePushInFlight || (now - autoHardwarePushLastMs) < 250) return;
   autoHardwarePushLastMs = now;
   autoHardwarePushInFlight = true;
 
-  pushAllTilesToHardware({ quiet: true })
-    .catch((err) => {
-      setPushStatus(`Auto mirror failed: ${err.message}${formatMirrorStatsSuffix()}`);
-      postMirrorError("auto-mirror-failed", {
-        error: err.message,
-        stats: state.mirrorStats,
-        animationActive: state.animation.active,
-        masters,
+  syncServerMirrorPlayback(false)
+    .catch((_serverErr) => {
+      // Fallback to legacy browser-side push if server mirror endpoint is unavailable.
+      return pushAllTilesToHardware({ quiet: true }).catch((err) => {
+        setPushStatus(`Auto mirror failed: ${err.message}${formatMirrorStatsSuffix()}`);
+        postMirrorError("auto-mirror-failed", {
+          error: err.message,
+          stats: state.mirrorStats,
+          animationActive: state.animation.active,
+          masters,
+        });
       });
     })
     .finally(() => {
@@ -3597,7 +3873,7 @@ async function probeSelectedMaster() {
   }
 }
 
-async function pushMasterToHardware(masterId) {
+async function pushMasterToHardware(masterId, tileRgbCache = null) {
   const ip = state.masterIPs[masterId];
   if (!ip) return;
 
@@ -3661,69 +3937,10 @@ async function pushMasterToHardware(masterId) {
     state.masterLedProbed[ip] = true;
   }
 
-  const chain = getOrderedTilesForMaster(masterId);
-
-  // Prefer wizard-assigned LED groups for slot placement. This preserves
-  // non-linear physical ordering discovered during mapping.
-  const tileGroupById = new Map();
-  for (const item of state.wizard.assignments || []) {
-    if (item.ip !== ip) continue;
-    if (!Number.isInteger(item.tileId)) continue;
-    const g = Number(item.ledGroup);
-    if (!Number.isInteger(g) || g < 1) continue;
-    tileGroupById.set(item.tileId, g);
-  }
-  const hasMappedGroups = tileGroupById.size > 0;
-  if (!tileGroupById.has(masterId)) {
-    tileGroupById.set(masterId, 1);
-  }
-
-  const deviceLeds = Number(totalLeds || 0);
-  let requiredLeds = deviceLeds;
-  for (const tileId of chain) {
-    const group = tileGroupById.get(tileId);
-    if (!Number.isInteger(group) || group < 1) continue;
-    const endLed = group * LEDS_PER_TILE;
-    if (endLed > requiredLeds) requiredLeds = endLed;
-  }
-  if (!Number.isFinite(requiredLeds) || requiredLeds < LEDS_PER_TILE) {
-    requiredLeds = LEDS_PER_TILE;
-  }
-  if (Number.isFinite(deviceLeds) && deviceLeds > 0) {
-    requiredLeds = Math.min(requiredLeds, deviceLeds);
-  }
-
-  // Allocate a full frame for the device (zeros = black for unprogrammed LEDs).
-  const frameBytes = new Uint8Array(requiredLeds * 3);
-
-  if (!hasMappedGroups) {
-    // No reliable physical slot mapping yet: mirror content to all slots so
-    // users still see virtual-map output while mapping is incomplete.
-    const slotCount = Math.max(1, Math.floor(requiredLeds / LEDS_PER_TILE));
-    for (let slot = 0; slot < slotCount; slot += 1) {
-      const tileId = chain[slot % chain.length] || masterId;
-      const pixels = getTilePixelRgb(tileId);
-      const base = slot * LEDS_PER_TILE * 3;
-      pixels.forEach(([r, g, b], pIdx) => {
-        frameBytes[base + pIdx * 3] = r;
-        frameBytes[base + pIdx * 3 + 1] = g;
-        frameBytes[base + pIdx * 3 + 2] = b;
-      });
-    }
-  } else {
-    chain.forEach((tileId, tileIdx) => {
-      const ledGroup = tileGroupById.get(tileId);
-      const slot = Number.isInteger(ledGroup) && ledGroup >= 1 ? (ledGroup - 1) : tileIdx;
-      if (slot >= requiredLeds / LEDS_PER_TILE) return;
-      const pixels = getTilePixelRgb(tileId);
-      const base = slot * LEDS_PER_TILE * 3;
-      pixels.forEach(([r, g, b], pIdx) => {
-        frameBytes[base + pIdx * 3]     = r;
-        frameBytes[base + pIdx * 3 + 1] = g;
-        frameBytes[base + pIdx * 3 + 2] = b;
-      });
-    });
-  }
+  const built = buildMasterFrameBytes(masterId, ip, totalLeds, tileRgbCache);
+  const frameBytes = built.frameBytes;
+  const requiredLeds = built.requiredLeds;
+  const strategy = built.strategy;
 
   const nowMs = Date.now();
   const rtAgeMs = nowMs - Number(state.twinklyRtModeAt[ip] || 0);
@@ -3756,14 +3973,14 @@ async function pushMasterToHardware(masterId) {
       state.twinklyRtMode[ip] = false;
       state.twinklyRtModeAt[ip] = 0;
       throw new Error(
-        `${err.message} (leds=${requiredLeds}, bytes=${frameBytes.length}, strategy=${hasMappedGroups ? "mapped-groups" : "broadcast-slots"})`
+        `${err.message} (leds=${requiredLeds}, bytes=${frameBytes.length}, strategy=${strategy})`
       );
     }
   }
 
   return {
     ip,
-    strategy: hasMappedGroups ? "mapped-groups" : "broadcast-slots",
+    strategy,
   };
 }
 
@@ -3778,10 +3995,20 @@ async function pushAllTilesToHardware(options = {}) {
     return;
   }
   if (!quiet) setPushStatus(`Pushing to ${masters.length} master(s)...`);
+  const tileRgbCache = new Map();
+  const neededTileIds = new Set();
+  for (const masterId of masters) {
+    for (const tileId of getOrderedTilesForMaster(masterId)) {
+      if (Number.isInteger(tileId)) neededTileIds.add(tileId);
+    }
+  }
+  for (const tileId of neededTileIds) {
+    tileRgbCache.set(tileId, getTilePixelRgb(tileId));
+  }
   const errors = [];
   const masterPushMeta = [];
   await Promise.all(masters.map((masterId) =>
-    pushMasterToHardware(masterId)
+    pushMasterToHardware(masterId, tileRgbCache)
       .then((meta) => {
         if (meta) masterPushMeta.push(meta);
       })
@@ -3846,25 +4073,54 @@ async function pushAllTilesToHardware(options = {}) {
 function startLivePush() {
   if (state.livePushActive) return;
   state.livePushActive = true;
+  state.livePushInFlight = false;
   el.btnToggleLivePush.textContent = "⏹ Stop Live Push";
   el.btnToggleLivePush.classList.add("danger");
   updateGeneralButtonStates();
 
-  let lastPush = 0;
-  function loop(now) {
-    if (!state.livePushActive) return;
+  const startBrowserLoopFallback = () => {
+    let lastPush = 0;
+    function loop(now) {
+      if (!state.livePushActive) return;
+      state.livePushRafId = requestAnimationFrame(loop);
+      if (now - lastPush < 33) return;   // cap at ~30 fps, adaptively reduced by in-flight guard
+      if (state.livePushInFlight) return;
+      lastPush = now;
+      state.livePushInFlight = true;
+      pushAllTilesToHardware()
+        .catch(() => {})
+        .finally(() => {
+          state.livePushInFlight = false;
+        });
+    }
     state.livePushRafId = requestAnimationFrame(loop);
-    if (now - lastPush < 50) return;   // cap at ~20 fps
-    lastPush = now;
-    pushAllTilesToHardware().catch(() => {});
+    setPushStatus("Live push running in browser fallback mode.");
+  };
+
+  if (state.serverMirrorEnabled) {
+    syncServerMirrorPlayback(true)
+      .then((started) => {
+        if (started) {
+          setPushStatus("Live push running server-side. It will continue after closing the browser.");
+          return;
+        }
+        startBrowserLoopFallback();
+      })
+      .catch(() => {
+        startBrowserLoopFallback();
+      });
+    return;
   }
-  state.livePushRafId = requestAnimationFrame(loop);
+
+  startBrowserLoopFallback();
 }
 
 function stopLivePush() {
   state.livePushActive = false;
+  state.livePushInFlight = false;
   if (state.livePushRafId != null) cancelAnimationFrame(state.livePushRafId);
   state.livePushRafId = null;
+  stopServerMirrorPlayback();
   el.btnToggleLivePush.textContent = "▶ Live Push";
   el.btnToggleLivePush.classList.remove("danger");
   setPushStatus("Live push stopped.");

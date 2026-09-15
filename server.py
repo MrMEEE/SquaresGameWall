@@ -12,6 +12,9 @@ import sys
 import json
 import base64
 import re
+import os
+import time
+import threading
 from datetime import datetime, timezone
 import urllib.request
 import urllib.error
@@ -23,6 +26,256 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 CLIENT_LOG_FILE = Path("/tmp/gamewall-clientlog.txt")
 WORKSPACE_ROOT = Path(__file__).resolve().parent
 CHARACTERS_ROOT = WORKSPACE_ROOT / "characters"
+
+
+class MirrorRuntime:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._running = False
+        self._fps = 20
+        self._frames = []
+        self._frame_index = 0
+        self._tokens = {}
+        self._rt_mode_at = {}
+        self._rt_frame_format = {}
+        self._last_push_at = ""
+        self._last_error = ""
+        self._push_ok = 0
+        self._push_err = 0
+
+    def status(self):
+        with self._lock:
+            return {
+                "running": self._running,
+                "fps": self._fps,
+                "frames": len(self._frames),
+                "frameIndex": self._frame_index,
+                "lastPushAt": self._last_push_at,
+                "lastError": self._last_error,
+                "pushOk": self._push_ok,
+                "pushErr": self._push_err,
+            }
+
+    def start(self, frames, fps=20):
+        safe_fps = max(1, min(60, int(fps or 20)))
+        if not isinstance(frames, list) or not frames:
+            raise ValueError("frames must be a non-empty list")
+
+        normalized = []
+        for item in frames:
+            masters = item.get("masters") if isinstance(item, dict) else None
+            if not isinstance(masters, list) or not masters:
+                continue
+            packed = []
+            for m in masters:
+                ip = str(m.get("ip") or "").strip()
+                data = m.get("frameBytes")
+                if not ip or not isinstance(data, (bytes, bytearray)) or len(data) < 3:
+                    continue
+                packed.append({"ip": ip, "frameBytes": bytes(data)})
+            if packed:
+                normalized.append({"masters": packed})
+
+        if not normalized:
+            raise ValueError("no valid frames to run")
+
+        self.stop(join_timeout=1.5)
+        with self._lock:
+            self._frames = normalized
+            self._fps = safe_fps
+            self._frame_index = 0
+            self._last_error = ""
+            self._stop_event = threading.Event()
+            self._running = True
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def stop(self, join_timeout=1.0):
+        thread = None
+        with self._lock:
+            if not self._running:
+                return
+            self._running = False
+            self._stop_event.set()
+            thread = self._thread
+            self._thread = None
+        if thread:
+            thread.join(timeout=join_timeout)
+
+    def _run(self):
+        while True:
+            with self._lock:
+                if not self._running or self._stop_event.is_set():
+                    return
+                fps = self._fps
+                frames = self._frames
+                idx = self._frame_index % len(frames)
+                frame = frames[idx]
+                self._frame_index = (idx + 1) % len(frames)
+
+            started = time.perf_counter()
+            for master in frame.get("masters", []):
+                ip = master.get("ip")
+                frame_bytes = master.get("frameBytes")
+                if not ip or not frame_bytes:
+                    continue
+                try:
+                    self._push_rt_frame(ip, frame_bytes)
+                    with self._lock:
+                        self._push_ok += 1
+                        self._last_push_at = _now_iso()
+                except Exception as exc:
+                    with self._lock:
+                        self._push_err += 1
+                        self._last_error = str(exc)
+
+            interval = 1.0 / max(1, fps)
+            elapsed = time.perf_counter() - started
+            sleep_s = max(0.0, interval - elapsed)
+            if self._stop_event.wait(sleep_s):
+                return
+
+    def _twinkly_fetch(self, ip, path, method="GET", body=None, headers=None, timeout=8):
+        url = f"http://{ip}{path}"
+        req_headers = headers.copy() if isinstance(headers, dict) else {}
+        req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read(), dict(resp.headers.items())
+
+    def _login(self, ip):
+        challenge = base64.b64encode(os.urandom(32)).decode("ascii")
+        body = json.dumps({"challenge": challenge}, ensure_ascii=True).encode("utf-8")
+        status, raw, _headers = self._twinkly_fetch(
+            ip,
+            "/xled/v1/login",
+            method="POST",
+            body=body,
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"login failed ({status})")
+        data = json.loads(raw.decode("utf-8") or "{}")
+        token = data.get("authentication_token")
+        challenge_response = data.get("challenge-response")
+        if not token or not challenge_response:
+            raise RuntimeError("login payload missing token or challenge-response")
+
+        verify_body = json.dumps({"challenge-response": challenge_response}, ensure_ascii=True).encode("utf-8")
+        v_status, _v_raw, _v_headers = self._twinkly_fetch(
+            ip,
+            "/xled/v1/verify",
+            method="POST",
+            body=verify_body,
+            headers={"Content-Type": "application/json", "X-Auth-Token": token},
+            timeout=10,
+        )
+        if v_status < 200 or v_status >= 300:
+            raise RuntimeError(f"verify failed ({v_status})")
+
+        self._tokens[ip] = {"token": token, "expiresAt": time.time() + (14 * 60)}
+        return token
+
+    def _token(self, ip):
+        cached = self._tokens.get(ip)
+        if cached and cached.get("expiresAt", 0) > (time.time() + 5):
+            return cached.get("token")
+        return self._login(ip)
+
+    def _set_rt_mode(self, ip, token):
+        body = json.dumps({"mode": "rt"}, ensure_ascii=True).encode("utf-8")
+        status, _raw, _headers = self._twinkly_fetch(
+            ip,
+            "/xled/v1/led/mode",
+            method="POST",
+            body=body,
+            headers={"Content-Type": "application/json", "X-Auth-Token": token},
+            timeout=8,
+        )
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"set rt mode failed ({status})")
+
+    def _assert_api_ok(self, raw, headers, path):
+        content_type = str(headers.get("Content-Type", "")).lower()
+        if "application/json" not in content_type:
+            return
+        try:
+            payload = json.loads((raw or b"").decode("utf-8") or "{}")
+        except Exception:
+            return
+        code = int(payload.get("code")) if str(payload.get("code", "")).isdigit() else None
+        if code is None or code == 1000:
+            return
+        msg = payload.get("error") or payload.get("message") or payload.get("detail") or "unknown error"
+        raise RuntimeError(f"twinkly api rejected {path}: code {code} ({msg})")
+
+    def _send_rt_frame_payload(self, ip, token, payload, tag):
+        status, raw, headers = self._twinkly_fetch(
+            ip,
+            "/xled/v1/led/rt/frame",
+            method="POST",
+            body=payload,
+            headers={"Content-Type": "application/octet-stream", "X-Auth-Token": token},
+            timeout=8,
+        )
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"rt frame {tag} failed ({status})")
+        self._assert_api_ok(raw, headers, f"/xled/v1/led/rt/frame({tag})")
+
+    def _push_rt_frame(self, ip, frame_bytes):
+        token = self._token(ip)
+        refresh = (time.time() - float(self._rt_mode_at.get(ip, 0) or 0)) > 5
+        if refresh:
+            self._set_rt_mode(ip, token)
+            self._rt_mode_at[ip] = time.time()
+
+        prefixed = bytes([1]) + bytes(frame_bytes)
+        cached = self._rt_frame_format.get(ip, "")
+
+        def send_with_format(fmt):
+            if fmt == "v1":
+                self._send_rt_frame_payload(ip, token, prefixed, "v1")
+                return "v1"
+            self._send_rt_frame_payload(ip, token, frame_bytes, "raw")
+            return "raw"
+
+        try:
+            if cached in ("v1", "raw"):
+                used = send_with_format(cached)
+                self._rt_frame_format[ip] = used
+                return
+
+            try:
+                used = send_with_format("v1")
+                self._rt_frame_format[ip] = used
+                return
+            except Exception:
+                used = send_with_format("raw")
+                self._rt_frame_format[ip] = used
+                return
+        except Exception as first_exc:
+            # Retry once with fresh auth and RT mode.
+            self._tokens.pop(ip, None)
+            self._rt_frame_format.pop(ip, None)
+            token = self._token(ip)
+            self._set_rt_mode(ip, token)
+            self._rt_mode_at[ip] = time.time()
+            try:
+                send_with_format("v1")
+                self._rt_frame_format[ip] = "v1"
+                return
+            except Exception:
+                try:
+                    send_with_format("raw")
+                    self._rt_frame_format[ip] = "raw"
+                    return
+                except Exception as retry_exc:
+                    raise RuntimeError(f"rt frame failed ({first_exc}; retry: {retry_exc})")
+
+
+MIRROR_RUNTIME = MirrorRuntime()
 
 
 def _now_iso():
@@ -42,6 +295,8 @@ class GameWallHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/proxy":
             self._handle_proxy("GET", parsed.query, body=None)
+        elif parsed.path == "/api/mirror/status":
+            self._json_response(200, MIRROR_RUNTIME.status())
         elif parsed.path == "/webproxy":
             self._handle_webproxy(parsed.query)
         elif parsed.path == "/sdbsearch":
@@ -61,6 +316,13 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else None
             self._handle_proxy("POST", parsed.query, body=body)
+        elif parsed.path == "/api/mirror/start":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length) if length else b""
+            self._handle_mirror_start(body)
+        elif parsed.path == "/api/mirror/stop":
+            MIRROR_RUNTIME.stop()
+            self._json_response(200, {"ok": True, "status": MIRROR_RUNTIME.status()})
         elif parsed.path == "/clientlog":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
@@ -680,6 +942,53 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
         except Exception as exc:
             self._json_response(502, {"error": str(exc)})
+
+    def _handle_mirror_start(self, body):
+        try:
+            payload = self._read_json_body(body)
+        except Exception as exc:
+            self._json_response(400, {"error": str(exc)})
+            return
+
+        fps = payload.get("fps", 20)
+        frames = payload.get("frames") if isinstance(payload, dict) else None
+        if not isinstance(frames, list) or not frames:
+            self._json_response(400, {"error": "frames[] is required"})
+            return
+
+        parsed_frames = []
+        try:
+            for frame in frames:
+                masters = frame.get("masters") if isinstance(frame, dict) else None
+                if not isinstance(masters, list) or not masters:
+                    continue
+                out_masters = []
+                for master in masters:
+                    ip = str(master.get("ip") or "").strip()
+                    frame_b64 = master.get("frameBase64")
+                    if not ip or not isinstance(frame_b64, str) or not frame_b64:
+                        continue
+                    raw = base64.b64decode(frame_b64.encode("ascii"), validate=True)
+                    if len(raw) < 3 or (len(raw) % 3) != 0:
+                        continue
+                    out_masters.append({"ip": ip, "frameBytes": raw})
+                if out_masters:
+                    parsed_frames.append({"masters": out_masters})
+        except Exception:
+            self._json_response(400, {"error": "Invalid frameBase64 payload"})
+            return
+
+        if not parsed_frames:
+            self._json_response(400, {"error": "No valid mirror frames were provided"})
+            return
+
+        try:
+            MIRROR_RUNTIME.start(parsed_frames, fps=fps)
+        except Exception as exc:
+            self._json_response(400, {"error": str(exc)})
+            return
+
+        self._json_response(200, {"ok": True, "status": MIRROR_RUNTIME.status()})
 
     def _handle_webproxy(self, query_string):
         params = urllib.parse.parse_qs(query_string)
