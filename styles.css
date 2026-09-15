@@ -121,6 +121,12 @@ h1 {
   margin-bottom: 10px;
 }
 
+.map-power-row {
+  display: flex;
+  justify-content: flex-start;
+  margin-bottom: 10px;
+}
+
 .map-brightness-row input[type="number"] {
   width: 100%;
 }

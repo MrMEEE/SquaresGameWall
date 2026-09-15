@@ -86,6 +86,7 @@ const state = {
   twinklyRtFrameFormat: {},
   livePushActive: false,
   livePushInFlight: false,
+  outputEnabled: true,
   serverMirrorEnabled: true,
   serverMirrorSyncInFlight: false,
   serverMirrorLastHash: "",
@@ -262,6 +263,7 @@ const el = {
   rowsInput: document.getElementById("rowsInput"),
   colsInput: document.getElementById("colsInput"),
   mastersInput: document.getElementById("mastersInput"),
+  btnMapPowerToggle: document.getElementById("btnMapPowerToggle"),
   mappedBrightnessRange: document.getElementById("mappedBrightnessRange"),
   mappedBrightnessNumber: document.getElementById("mappedBrightnessNumber"),
   btnResize: document.getElementById("btnResize"),
@@ -1535,6 +1537,92 @@ function setMappedBrightness(value) {
   setStatus(`Mapped tile brightness set to ${next}%.`);
 }
 
+function updateMapPowerButtonState() {
+  if (!el.btnMapPowerToggle) return;
+  if (state.outputEnabled) {
+    el.btnMapPowerToggle.textContent = "Output: ON";
+    el.btnMapPowerToggle.classList.add("danger");
+    el.btnMapPowerToggle.classList.remove("secondary");
+  } else {
+    el.btnMapPowerToggle.textContent = "Output: OFF";
+    el.btnMapPowerToggle.classList.remove("danger");
+    el.btnMapPowerToggle.classList.add("secondary");
+  }
+}
+
+async function pushMasterBlack(masterId) {
+  const ip = state.masterIPs[masterId];
+  if (!ip) return;
+  const token = await twinklyToken(ip);
+  const ledCount = Math.max(LEDS_PER_TILE, estimateMasterLedCount(masterId, ip));
+  const frameBytes = new Uint8Array(ledCount * 3);
+
+  const nowMs = Date.now();
+  const rtAgeMs = nowMs - Number(state.twinklyRtModeAt[ip] || 0);
+  const refreshRt = !state.twinklyRtMode[ip] || rtAgeMs > 5000;
+
+  try {
+    if (refreshRt) {
+      await twinklySetRtMode(ip, token);
+      state.twinklyRtMode[ip] = true;
+      state.twinklyRtModeAt[ip] = nowMs;
+    }
+    await twinklyPushFrame(ip, token, frameBytes);
+  } catch (err) {
+    state.twinklyRtMode[ip] = false;
+    state.twinklyRtModeAt[ip] = 0;
+    throw err;
+  }
+}
+
+async function setMapOutputEnabled(enabled) {
+  const next = Boolean(enabled);
+  if (next === state.outputEnabled) {
+    updateMapPowerButtonState();
+    return;
+  }
+
+  if (!next) {
+    if (state.livePushActive) stopLivePush();
+    state.outputEnabled = false;
+    updateMapPowerButtonState();
+    await stopServerMirrorPlayback();
+
+    const masters = Object.keys(state.masterIPs || {})
+      .map((k) => Number(k))
+      .filter((id) => Number.isInteger(id) && Boolean(getTileById(id)));
+    const errors = [];
+    await Promise.all(masters.map((masterId) =>
+      pushMasterBlack(masterId).catch((err) => {
+        const ip = state.masterIPs[masterId];
+        errors.push(`${ip}: ${err.message}`);
+      })
+    ));
+    if (errors.length) {
+      setPushStatus(`Output OFF requested, but some masters failed: ${errors.join(" | ")}`);
+      setStatus(`Output OFF requested with ${errors.length} error(s).`);
+      return;
+    }
+    setPushStatus("Output OFF: all configured masters set to black frame.");
+    setStatus("Map output disabled.");
+    return;
+  }
+
+  state.outputEnabled = true;
+  updateMapPowerButtonState();
+  try {
+    const started = await syncServerMirrorPlayback(true);
+    if (started) {
+      setPushStatus("Output ON: server-side mirror resumed.");
+    } else {
+      await pushAllTilesToHardware({ quiet: false });
+    }
+  } catch (_e) {
+    await pushAllTilesToHardware({ quiet: false });
+  }
+  setStatus("Map output enabled.");
+}
+
 function showTileContextMenu(tileId, clientX, clientY) {
   if (!el.tileContextMenu) return;
   const tile = getTileById(tileId);
@@ -2529,6 +2617,7 @@ function postMirrorError(message, details = null, minIntervalMs = 2500) {
 }
 
 function maybeAutoSyncHardwareFromVirtualMap() {
+  if (!state.outputEnabled) return;
   if (state.wizard.active) return;
   if (state.livePushActive) return;
 
@@ -4091,6 +4180,10 @@ async function pushAllTilesToHardware(options = {}) {
 }
 
 function startLivePush() {
+  if (!state.outputEnabled) {
+    setStatus("Output is OFF. Turn output ON first.");
+    return;
+  }
   if (state.livePushActive) return;
   state.livePushActive = true;
   state.livePushInFlight = false;
@@ -6692,6 +6785,16 @@ function bindEvents() {
   el.colsInput.addEventListener("input", updateGeneralButtonStates);
   el.mastersInput.addEventListener("input", updateGeneralButtonStates);
 
+  if (el.btnMapPowerToggle) {
+    el.btnMapPowerToggle.addEventListener("click", async () => {
+      try {
+        await setMapOutputEnabled(!state.outputEnabled);
+      } catch (err) {
+        setStatus(`Output toggle failed: ${err.message}`);
+      }
+    });
+  }
+
   if (el.mappedBrightnessRange) {
     el.mappedBrightnessRange.addEventListener("input", () => {
       setMappedBrightness(el.mappedBrightnessRange.value);
@@ -7963,6 +8066,7 @@ async function init() {
   closeDetectModal();
   switchView("map");
   syncMappedBrightnessControls();
+  updateMapPowerButtonState();
   renderActionSelect();
   renderActionTimeline();
   renderCharacterSearchResults();
