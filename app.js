@@ -105,6 +105,7 @@ const state = {
     queueIps: [],
     blinkTimerId: null,
     blinkRunId: 0,
+    firstRedShown: false,
     blinkOn: false,
     blinkInFlight: false,
     segmentLedGroups: [],
@@ -1613,25 +1614,40 @@ async function twinklyFetch(ip, path, options = {}) {
 }
 
 async function twinklyLogin(ip) {
-  const body = { challenge: btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))) };
-  const res = await twinklyFetch(ip, "/xled/v1/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Login failed (${res.status})`);
-  const json = await res.json();
-  const token = json.authentication_token;
-  const challengeResponse = json["challenge-response"];
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const body = { challenge: btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32)))) };
+      const res = await twinklyFetch(ip, "/xled/v1/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        timeoutMs: 8000,
+      });
+      if (!res.ok) throw new Error(`Login failed (${res.status})`);
+      const json = await res.json();
+      const token = json.authentication_token;
+      const challengeResponse = json["challenge-response"];
 
-  await twinklyFetch(ip, "/xled/v1/verify", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Auth-Token": token },
-    body: JSON.stringify({ "challenge-response": challengeResponse }),
-  });
+      await twinklyFetch(ip, "/xled/v1/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Auth-Token": token },
+        body: JSON.stringify({ "challenge-response": challengeResponse }),
+        timeoutMs: 7000,
+      });
 
-  state.twinklyTokens[ip] = { token, expiresAt: Date.now() + 14 * 60 * 1000 };
-  return token;
+      state.twinklyTokens[ip] = { token, expiresAt: Date.now() + 14 * 60 * 1000 };
+      return token;
+    } catch (err) {
+      lastErr = err;
+      delete state.twinklyTokens[ip];
+      if (attempt >= 3) break;
+      await new Promise((resolve) => setTimeout(resolve, 150 * attempt));
+    }
+  }
+
+  const msg = lastErr && lastErr.message ? lastErr.message : String(lastErr);
+  throw new Error(`Login failed after retries: ${msg}`);
 }
 
 async function twinklyToken(ip) {
@@ -2752,6 +2768,9 @@ function startWizardRedBlink() {
       try {
         state.wizard.blinkOn = !state.wizard.blinkOn;
         await pushWizardSegmentPattern(state.wizard.blinkOn ? "red" : "off", 0);
+        if (state.wizard.blinkOn) {
+          state.wizard.firstRedShown = true;
+        }
         if (runId !== state.wizard.blinkRunId) {
           state.wizard.blinkTimerId = null;
           return;
@@ -2870,6 +2889,7 @@ async function wizardStepProbeGroup(delta) {
   state.wizard.currentProbeGroupIndex = next;
   state.wizard.blinkOn = true;
   await pushWizardSegmentPattern("red", 0);
+  state.wizard.firstRedShown = true;
   setWizardStatus(buildWizardLocateStatus());
   renderWizardGroupBadge();
   updateWizardControlStates();
@@ -2900,6 +2920,7 @@ async function wizardBlinkRed() {
     return;
   }
   state.wizard.phase = "locate";
+  state.wizard.firstRedShown = false;
   ensureWizardProbeIndexForCurrentSegment();
   startWizardRedBlink();
   setWizardStatus(buildWizardLocateStatus());
@@ -2925,6 +2946,10 @@ async function wizardShowYellow() {
 
 async function wizardSelectTileFromMap(tileId) {
   if (!state.wizard.active || state.wizard.phase !== "locate") return;
+  if (!state.wizard.firstRedShown) {
+    setWizardStatus("Waiting for first RED blink to reach device. Please wait before selecting a tile.");
+    return;
+  }
 
   const tile = getTileById(tileId);
   if (!tile) return;
@@ -3295,6 +3320,7 @@ async function wizardStartForIp(ip, options = {}) {
   state.wizard.totalSegments = 1;
   state.wizard.currentSegment = 0;
   state.wizard.phase = "locate";
+  state.wizard.firstRedShown = false;
   state.wizard.yellowShown = false;
   state.wizard.segmentLedGroups = [];
   state.wizard.segmentGroupSource = "fallback";
@@ -4425,6 +4451,7 @@ function resetAll() {
     queueIps: [],
     blinkTimerId: null,
     blinkRunId: 0,
+    firstRedShown: false,
     blinkOn: false,
     blinkInFlight: false,
     segmentLedGroups: [],
@@ -7144,6 +7171,7 @@ function applyMapSnapshot(d) {
   state.wizard.assignments = [];
   state.wizard.queueIps = [];
   state.wizard.blinkTimerId = null;
+  state.wizard.firstRedShown = false;
   state.wizard.blinkOn = false;
   state.wizard.blinkInFlight = false;
   state.wizard.segmentLedGroups = [];
