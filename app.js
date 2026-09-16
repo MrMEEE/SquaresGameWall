@@ -2963,6 +2963,8 @@ function formatMirrorRuntimeReadout(status) {
   const lead = Number(status.dispatchLeadMs) || 0;
   const mode = String(status.playbackMode || "rt");
   const movieEffectiveFps = Number(status.movieEffectiveFps) || 0;
+  const movieSyncMasterIp = String(status.movieSyncMasterIp || "").trim();
+  const movieSyncId = String(status.movieSyncId || "").trim();
   const frameIndex = Number(status.frameIndex) || 0;
   const adaptiveEnabled = Boolean(status.adaptiveSyncEnabled);
   const adaptiveGain = Number(status.adaptiveGain) || 0;
@@ -2979,6 +2981,7 @@ function formatMirrorRuntimeReadout(status) {
     : {};
   const lines = [
     `Mirror runtime: ${running} | mode ${mode} | fps ${fps} | movieFps ${movieEffectiveFps || "-"} | lead ${lead}ms | frame ${frameIndex}`,
+    `movieSync master:${movieSyncMasterIp || "-"} id:${movieSyncId || "-"}`,
     `adaptive:${adaptiveEnabled ? "on" : "off"} gain:${adaptiveGain} max:${adaptiveMaxMs}ms burst:${burstCount}`,
     `Push ok:${Number(status.pushOk) || 0} err:${Number(status.pushErr) || 0}`,
   ];
@@ -2999,6 +3002,7 @@ function formatMirrorRuntimeReadout(status) {
   lines.push("workers:");
   for (const w of workers) {
     const ip = String(w?.ip || "?");
+    const isSyncMaster = Boolean(movieSyncMasterIp) && ip === movieSyncMasterIp;
     const pushOk = Number(w?.pushOk) || 0;
     const pushErr = Number(w?.pushErr) || 0;
     const wf = Number(w?.targetFps) || 0;
@@ -3018,7 +3022,7 @@ function formatMirrorRuntimeReadout(status) {
     if (rtModeMs > 0) movieBits.push(`rtMode:${rtModeMs.toFixed(0)}ms`);
     if (workerLastError) movieBits.push(`lastErr:${workerLastError}`);
     const movieTiming = movieBits.length ? ` ${movieBits.join(" ")}` : "";
-    lines.push(`- ${ip} fps:${wf} off:${offsetMs}ms adapt:${Math.round(adaptiveCorrectionMs)}ms send:${avgSendMs.toFixed(1)}+/-${jitterMs.toFixed(1)} lag:${Math.round(lagMs)}ms ok:${pushOk} err:${pushErr}${movieTiming}`);
+    lines.push(`- ${ip}${isSyncMaster ? " [sync-master]" : ""} fps:${wf} off:${offsetMs}ms adapt:${Math.round(adaptiveCorrectionMs)}ms send:${avgSendMs.toFixed(1)}+/-${jitterMs.toFixed(1)} lag:${Math.round(lagMs)}ms ok:${pushOk} err:${pushErr}${movieTiming}`);
   }
   return lines.join("\n");
 }

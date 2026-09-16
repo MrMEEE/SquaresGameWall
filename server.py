@@ -255,6 +255,8 @@ class MirrorRuntime:
         self._movie_effective_fps = 0
         self._movie_upload_ms_by_ip = {}
         self._movie_start_ms_by_ip = {}
+        self._movie_sync_master_ip = ""
+        self._movie_sync_id = ""
         self._rt_mode_switch_ms_by_ip = {}
         self._dispatch_seq = 0
 
@@ -272,6 +274,8 @@ class MirrorRuntime:
                 "movieEffectiveFps": int(self._movie_effective_fps or 0),
                 "movieUploadMsByIp": {ip: round(float(ms), 2) for ip, ms in self._movie_upload_ms_by_ip.items()},
                 "movieStartMsByIp": {ip: round(float(ms), 2) for ip, ms in self._movie_start_ms_by_ip.items()},
+                "movieSyncMasterIp": self._movie_sync_master_ip,
+                "movieSyncId": self._movie_sync_id,
                 "rtModeSwitchMsByIp": {ip: round(float(ms), 2) for ip, ms in self._rt_mode_switch_ms_by_ip.items()},
                 "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
                 "masterOffsetsMs": {ip: int(round(sec * 1000.0)) for ip, sec in self._master_offsets_s.items()},
@@ -462,6 +466,8 @@ class MirrorRuntime:
             self._movie_effective_fps = 0
             self._movie_upload_ms_by_ip = {}
             self._movie_start_ms_by_ip = {}
+            self._movie_sync_master_ip = ""
+            self._movie_sync_id = ""
             # Force an explicit RT mode switch on the next push after any
             # prior mode changes (especially returning from device movie mode).
             self._rt_mode_at = {}
@@ -832,15 +838,42 @@ class MirrorRuntime:
         if mode_value not in ("none", "master", "slave"):
             mode_value = "none"
 
+        sync_id = ""
+        if mode_value in ("master", "slave"):
+            sync_id = str(self._movie_sync_id or "").strip()
+
         def do_set_sync(token):
-            self._post_json(ip, "/xled/v1/led/movie/config", token, {
-                "sync": {
-                    "mode": mode_value,
-                }
-            })
+            sync_payload = {"mode": mode_value}
+            if mode_value == "master":
+                sync_payload["master_id"] = sync_id
+            elif mode_value == "slave":
+                sync_payload["slave_id"] = sync_id
+            else:
+                sync_payload["master_id"] = ""
+                sync_payload["slave_id"] = ""
+            self._post_json(ip, "/xled/v1/led/movie/config", token, {"sync": sync_payload})
             return True
 
         self._call_with_token_retry(ip, do_set_sync)
+
+    def _sync_identity_for_ip(self, ip):
+        try:
+            status, raw, _headers = self._twinkly_fetch(
+                ip,
+                "/xled/v1/gestalt",
+                method="GET",
+                timeout=1.5,
+            )
+            if status < 200 or status >= 300:
+                return ""
+            payload = json.loads(raw.decode("utf-8") or "{}")
+            for key in ("hw_id", "uuid", "mac"):
+                value = str(payload.get(key) or "").strip()
+                if value:
+                    return value
+            return ""
+        except Exception:
+            return ""
 
     def _start_device_movie(self, frames, fps):
         if not isinstance(frames, list) or not frames:
@@ -898,6 +931,14 @@ class MirrorRuntime:
         # Configure firmware-native movie sync roles.
         sync_ips = list(frames_by_ip.keys())
         sync_master_ip = sync_ips[0] if sync_ips else ""
+        shared_sync_id = self._sync_identity_for_ip(sync_master_ip) if sync_master_ip else ""
+        if not shared_sync_id:
+            shared_sync_id = sync_master_ip
+
+        with self._lock:
+            self._movie_sync_master_ip = sync_master_ip
+            self._movie_sync_id = shared_sync_id
+
         sync_errors = []
         for ip in sync_ips:
             role = "none"
