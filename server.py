@@ -16,6 +16,7 @@ import os
 import uuid
 import time
 import threading
+import socket
 from datetime import datetime, timezone
 import urllib.request
 import urllib.error
@@ -235,6 +236,7 @@ class MirrorRuntime:
         self._tokens = {}
         self._rt_mode_at = {}
         self._rt_frame_format = {}
+        self._rt_udp_hint_by_ip = {}
         self._last_push_at = ""
         self._last_error = ""
         self._push_ok = 0
@@ -922,6 +924,74 @@ class MirrorRuntime:
             raise RuntimeError(f"rt frame {tag} failed ({status})")
         self._assert_api_ok(raw, headers, f"/xled/v1/led/rt/frame({tag})")
 
+    def _rt_udp_hint(self, ip):
+        cached = self._rt_udp_hint_by_ip.get(ip)
+        if cached in (1, 2, 3):
+            return cached
+        hint = 3
+        try:
+            status, raw, _headers = self._twinkly_fetch(
+                ip,
+                "/xled/v1/gestalt",
+                method="GET",
+                timeout=1.2,
+            )
+            if status >= 200 and status < 300:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+                fw_family = str(payload.get("fw_family") or "").strip().upper()
+                if fw_family == "D":
+                    hint = 1
+                else:
+                    hint = 3
+        except Exception:
+            hint = 3
+        self._rt_udp_hint_by_ip[ip] = hint
+        return hint
+
+    def _send_rt_udp_v1(self, ip, token_bytes, frame_bytes):
+        led_count = len(frame_bytes) // 3
+        if led_count < 1 or led_count > 255:
+            raise RuntimeError(f"udp v1 unsupported led count {led_count}")
+        payload = bytes([0x01]) + token_bytes + bytes([led_count]) + bytes(frame_bytes)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(payload, (ip, 7777))
+
+    def _send_rt_udp_v2(self, ip, token_bytes, frame_bytes):
+        payload = bytes([0x02]) + token_bytes + bytes([0x00]) + bytes(frame_bytes)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(payload, (ip, 7777))
+
+    def _send_rt_udp_v3(self, ip, token_bytes, frame_bytes):
+        max_chunk = 900
+        fb = bytes(frame_bytes)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            frag = 0
+            for start in range(0, len(fb), max_chunk):
+                chunk = fb[start:start + max_chunk]
+                header = bytes([0x03]) + token_bytes + bytes([0x00, 0x00, frag & 0xFF])
+                sock.sendto(header + chunk, (ip, 7777))
+                frag += 1
+
+    def _push_rt_frame_udp(self, ip, token, frame_bytes):
+        try:
+            token_bytes = base64.b64decode(str(token).encode("ascii"), validate=True)
+        except Exception as exc:
+            raise RuntimeError(f"invalid auth token for udp: {exc}")
+        if len(token_bytes) != 8:
+            raise RuntimeError(f"invalid udp auth token size {len(token_bytes)}")
+
+        hint = self._rt_udp_hint(ip)
+        if hint == 1:
+            self._send_rt_udp_v1(ip, token_bytes, frame_bytes)
+            self._rt_frame_format[ip] = "udp1"
+            return
+
+        # Gen2 devices vary between v2 and v3 across firmware lines.
+        # Send both variants to maximize compatibility.
+        self._send_rt_udp_v3(ip, token_bytes, frame_bytes)
+        self._send_rt_udp_v2(ip, token_bytes, frame_bytes)
+        self._rt_frame_format[ip] = "udp3+2"
+
     def _push_rt_frame(self, ip, frame_bytes):
         token = self._token(ip)
         refresh = (time.time() - float(self._rt_mode_at.get(ip, 0) or 0)) > 20
@@ -930,6 +1000,13 @@ class MirrorRuntime:
             self._set_rt_mode(ip, token)
             self._rt_mode_at[ip] = time.time()
             self._rt_mode_switch_ms_by_ip[ip] = (time.perf_counter() - mode_started) * 1000.0
+
+        # Prefer UDP realtime transport; fallback to HTTP endpoint when needed.
+        try:
+            self._push_rt_frame_udp(ip, token, frame_bytes)
+            return
+        except Exception:
+            pass
 
         prefixed = bytes([1]) + bytes(frame_bytes)
         cached = self._rt_frame_format.get(ip, "")
@@ -959,11 +1036,17 @@ class MirrorRuntime:
             # Retry once with fresh auth and RT mode.
             self._tokens.pop(ip, None)
             self._rt_frame_format.pop(ip, None)
+            self._rt_udp_hint_by_ip.pop(ip, None)
             token = self._token(ip)
             mode_started = time.perf_counter()
             self._set_rt_mode(ip, token)
             self._rt_mode_at[ip] = time.time()
             self._rt_mode_switch_ms_by_ip[ip] = (time.perf_counter() - mode_started) * 1000.0
+            try:
+                self._push_rt_frame_udp(ip, token, frame_bytes)
+                return
+            except Exception:
+                pass
             try:
                 send_with_format("v1")
                 self._rt_frame_format[ip] = "v1"

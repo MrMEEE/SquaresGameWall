@@ -2970,6 +2970,7 @@ function formatMirrorRuntimeReadout(status) {
     const adaptiveCorrectionMs = Number(w?.lastAdaptiveCorrectionMs) || 0;
     const avgSendMs = Number(w?.avgSendMs) || 0;
     const jitterMs = Number(w?.jitterMs) || 0;
+    const workerLastError = String(w?.lastError || "").trim();
     const uploadMs = Number(movieUploadMsByIp[ip]) || 0;
     const startMs = Number(movieStartMsByIp[ip]) || 0;
     const rtModeMs = Number(rtModeSwitchMsByIp[ip]) || 0;
@@ -2979,6 +2980,7 @@ function formatMirrorRuntimeReadout(status) {
     if (uploadMs > 0) movieBits.push(`up:${uploadMs.toFixed(0)}ms`);
     if (startMs > 0) movieBits.push(`start:${startMs.toFixed(0)}ms`);
     if (rtModeMs > 0) movieBits.push(`rtMode:${rtModeMs.toFixed(0)}ms`);
+    if (workerLastError) movieBits.push(`lastErr:${workerLastError}`);
     const movieTiming = movieBits.length ? ` ${movieBits.join(" ")}` : "";
     lines.push(`- ${ip} fps:${wf} off:${offsetMs}ms adapt:${Math.round(adaptiveCorrectionMs)}ms send:${avgSendMs.toFixed(1)}+/-${jitterMs.toFixed(1)} lag:${Math.round(lagMs)}ms ok:${pushOk} err:${pushErr}${movieTiming}`);
   }
