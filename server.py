@@ -438,21 +438,9 @@ class MirrorRuntime:
         if not normalized:
             raise ValueError("no valid frames to run")
 
-        # Probe all active masters in parallel so a slow/offline unit doesn't
-        # block the mirror start path for everyone else.
-        worker_fps = {}
-        if active_ips:
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(active_ips))) as pool:
-                future_map = {
-                    pool.submit(self._probe_target_fps, ip, safe_fps): ip
-                    for ip in active_ips
-                }
-                for future, ip in future_map.items():
-                    try:
-                        worker_fps[ip] = float(future.result(timeout=1.6))
-                    except Exception:
-                        worker_fps[ip] = float(safe_fps)
+        # Use requested FPS directly. Capability probing proved unreliable on
+        # some devices and could clamp runtime to ~1 FPS.
+        worker_fps = {ip: float(safe_fps) for ip in active_ips}
 
         self.stop(join_timeout=1.5)
         workers_to_stop = []
@@ -835,17 +823,9 @@ class MirrorRuntime:
         if not frames_by_ip:
             raise ValueError("no valid frames to run")
 
-        effective_fps = int(fps)
-        probed = []
-        for ip in frames_by_ip.keys():
-            try:
-                p = float(self._probe_target_fps(ip, fps))
-                if p > 0:
-                    probed.append(p)
-            except Exception:
-                pass
-        if probed:
-            effective_fps = max(1, min(60, int(round(min(probed)))))
+        # Use requested FPS directly; per-device probing can misreport very low
+        # transient values and break animation smoothness.
+        effective_fps = max(1, min(60, int(fps or 20)))
 
         self.stop(join_timeout=1.5)
 
