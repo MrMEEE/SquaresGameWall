@@ -827,6 +827,21 @@ class MirrorRuntime:
             return True
         self._call_with_token_retry(ip, do_set_mode)
 
+    def _set_movie_sync_mode_for_ip(self, ip, mode):
+        mode_value = str(mode or "none").strip().lower()
+        if mode_value not in ("none", "master", "slave"):
+            mode_value = "none"
+
+        def do_set_sync(token):
+            self._post_json(ip, "/xled/v1/led/movie/config", token, {
+                "sync": {
+                    "mode": mode_value,
+                }
+            })
+            return True
+
+        self._call_with_token_retry(ip, do_set_sync)
+
     def _start_device_movie(self, frames, fps):
         if not isinstance(frames, list) or not frames:
             raise ValueError("frames must be a non-empty list")
@@ -879,6 +894,22 @@ class MirrorRuntime:
 
         if errors:
             raise RuntimeError("; ".join(errors[:3]))
+
+        # Configure firmware-native movie sync roles.
+        sync_ips = list(frames_by_ip.keys())
+        sync_master_ip = sync_ips[0] if sync_ips else ""
+        sync_errors = []
+        for ip in sync_ips:
+            role = "none"
+            if len(sync_ips) > 1:
+                role = "master" if ip == sync_master_ip else "slave"
+            try:
+                self._set_movie_sync_mode_for_ip(ip, role)
+            except Exception as exc:
+                sync_errors.append(f"{ip}: {exc}")
+
+        if sync_errors:
+            raise RuntimeError("movie sync role setup failed: " + "; ".join(sync_errors[:3]))
 
         # Start playback as closely as possible across masters.
         # Pre-fetch tokens before the barrier so auth refresh latency does not
