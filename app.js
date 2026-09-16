@@ -90,6 +90,7 @@ const state = {
   mapOutputTransitionInFlight: false,
   serverSyncLeadMs: 12,
   serverMirrorPlaybackMode: "rt",
+  serverMovieAnimationFps: 4,
   masterSyncOffsetsMs: {},
   offsetCalibrationPatternEnabled: false,
   serverMirrorEnabled: true,
@@ -272,6 +273,8 @@ const el = {
   mirrorPlaybackModeSelect: document.getElementById("mirrorPlaybackModeSelect"),
   syncLeadRange: document.getElementById("syncLeadRange"),
   syncLeadNumber: document.getElementById("syncLeadNumber"),
+  movieAnimFpsRange: document.getElementById("movieAnimFpsRange"),
+  movieAnimFpsNumber: document.getElementById("movieAnimFpsNumber"),
   btnOffsetCalibrationPattern: document.getElementById("btnOffsetCalibrationPattern"),
   mirrorRuntimeReadout: document.getElementById("mirrorRuntimeReadout"),
   mappedBrightnessRange: document.getElementById("mappedBrightnessRange"),
@@ -1380,6 +1383,7 @@ function getMirrorPayloadSignature(masters) {
     mappedBrightness: state.mappedBrightness,
     serverSyncLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
     serverMirrorPlaybackMode: normalizeMirrorPlaybackMode(state.serverMirrorPlaybackMode),
+    serverMovieAnimationFps: clampMovieAnimationFps(state.serverMovieAnimationFps, 4),
     tileBrightnessOffsets: state.tileBrightnessOffsets,
     demoOffsetX: state.demoOffsetX,
     demoOffsetY: state.demoOffsetY,
@@ -1434,6 +1438,9 @@ function buildServerMirrorPayload(masters) {
   const calibrationMode = Boolean(state.offsetCalibrationPatternEnabled);
   const playbackMode = normalizeMirrorPlaybackMode(state.serverMirrorPlaybackMode);
   const movieMode = playbackMode === "device_movie";
+  const movieAnimationFps = clampMovieAnimationFps(state.serverMovieAnimationFps, 4);
+  const animFrames = state.animation.frames.length;
+  const animActive = state.animation.active && animFrames > 0;
   const maxLeds = masters.reduce((acc, masterId) => {
     const ip = state.masterIPs[masterId];
     if (!ip) return acc;
@@ -1446,8 +1453,10 @@ function buildServerMirrorPayload(masters) {
       ? (maxLeds > 4096 ? 20 : 24)
       : (maxLeds > 4096 ? 12 : (maxLeds > 2048 ? 16 : 20)));
   const frameCount = calibrationMode ? (targetFps * 2) : (() => {
-    const animFrames = state.animation.frames.length;
-    const animActive = state.animation.active && animFrames > 0;
+    if (movieMode && animActive) {
+      // Keep one loop worth of source frames and slow playback via fps.
+      return Math.max(1, animFrames);
+    }
     const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
     const cycleMs = animActive ? (durationMs * animFrames) : 1000;
     const frameBudget = movieMode ? 180 : 90;
@@ -1457,8 +1466,9 @@ function buildServerMirrorPayload(masters) {
     return 1;
   })();
   const fps = calibrationMode ? targetFps : (() => {
-    const animFrames = state.animation.frames.length;
-    const animActive = state.animation.active && animFrames > 0;
+    if (movieMode && animActive) {
+      return movieAnimationFps;
+    }
     const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
     const cycleMs = animActive ? (durationMs * animFrames) : 1000;
     if (animActive) {
@@ -1667,6 +1677,12 @@ function clampSyncLeadMs(value, fallback = 12) {
   return Math.max(0, Math.min(30, Math.round(n)));
 }
 
+function clampMovieAnimationFps(value, fallback = 4) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(1, Math.min(24, Math.round(n)));
+}
+
 function normalizeMirrorPlaybackMode(value) {
   return value === "device_movie" ? "device_movie" : "rt";
 }
@@ -1676,10 +1692,28 @@ function syncSyncLeadControls() {
   state.serverSyncLeadMs = value;
   if (el.syncLeadRange) el.syncLeadRange.value = String(value);
   if (el.syncLeadNumber) el.syncLeadNumber.value = String(value);
+  const movieFps = clampMovieAnimationFps(state.serverMovieAnimationFps, 4);
+  state.serverMovieAnimationFps = movieFps;
+  if (el.movieAnimFpsRange) el.movieAnimFpsRange.value = String(movieFps);
+  if (el.movieAnimFpsNumber) el.movieAnimFpsNumber.value = String(movieFps);
   state.serverMirrorPlaybackMode = normalizeMirrorPlaybackMode(state.serverMirrorPlaybackMode);
   if (el.mirrorPlaybackModeSelect) {
     el.mirrorPlaybackModeSelect.value = state.serverMirrorPlaybackMode;
   }
+}
+
+function setMovieAnimationFps(value) {
+  const next = clampMovieAnimationFps(value, 4);
+  if (next === state.serverMovieAnimationFps) {
+    syncSyncLeadControls();
+    return;
+  }
+  state.serverMovieAnimationFps = next;
+  syncSyncLeadControls();
+  state.serverMirrorLastHash = "";
+  saveMapAutosave();
+  maybeAutoSyncHardwareFromVirtualMap();
+  setStatus(`Movie animation FPS set to ${next}.`);
 }
 
 async function applyServerMirrorTuning() {
@@ -5032,6 +5066,7 @@ function buildExportPayload(includeGeneratedAt = true) {
     mirror: {
       syncLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
       playbackMode: normalizeMirrorPlaybackMode(state.serverMirrorPlaybackMode),
+      movieAnimationFps: clampMovieAnimationFps(state.serverMovieAnimationFps, 4),
       masterOffsetsMs: { ...state.masterSyncOffsetsMs },
       offsetCalibrationPatternEnabled: Boolean(state.offsetCalibrationPatternEnabled),
     },
@@ -5111,6 +5146,7 @@ async function importData(data) {
   state.offsetCalibrationPatternEnabled = Boolean(data?.mirror?.offsetCalibrationPatternEnabled);
   state.serverMirrorPlaybackMode = normalizeMirrorPlaybackMode(data?.mirror?.playbackMode);
   state.serverSyncLeadMs = clampSyncLeadMs(data?.mirror?.syncLeadMs, 12);
+  state.serverMovieAnimationFps = clampMovieAnimationFps(data?.mirror?.movieAnimationFps, 4);
   state.mappedBrightness = clampBrightnessPercent(data?.brightness?.mappedPercent, 100);
   state.wizard.lockedTiles = {};
   state.wizard.assignments = [];
@@ -7286,6 +7322,16 @@ function bindEvents() {
       setServerSyncLeadMs(el.syncLeadNumber.value);
     });
   }
+  if (el.movieAnimFpsRange) {
+    el.movieAnimFpsRange.addEventListener("input", () => {
+      setMovieAnimationFps(el.movieAnimFpsRange.value);
+    });
+  }
+  if (el.movieAnimFpsNumber) {
+    el.movieAnimFpsNumber.addEventListener("change", () => {
+      setMovieAnimationFps(el.movieAnimFpsNumber.value);
+    });
+  }
   if (el.mirrorPlaybackModeSelect) {
     el.mirrorPlaybackModeSelect.addEventListener("change", () => {
       setServerMirrorPlaybackMode(el.mirrorPlaybackModeSelect.value);
@@ -8110,6 +8156,7 @@ function buildMapSnapshot() {
     mirror: {
       syncLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
       playbackMode: normalizeMirrorPlaybackMode(state.serverMirrorPlaybackMode),
+      movieAnimationFps: clampMovieAnimationFps(state.serverMovieAnimationFps, 4),
       masterOffsetsMs: { ...state.masterSyncOffsetsMs },
       offsetCalibrationPatternEnabled: Boolean(state.offsetCalibrationPatternEnabled),
     },
@@ -8278,6 +8325,7 @@ function applyMapSnapshot(d) {
   state.masterSyncOffsetsMs = {};
   state.offsetCalibrationPatternEnabled = Boolean(d?.mirror?.offsetCalibrationPatternEnabled);
   state.serverMirrorPlaybackMode = normalizeMirrorPlaybackMode(d?.mirror?.playbackMode);
+  state.serverMovieAnimationFps = clampMovieAnimationFps(d?.mirror?.movieAnimationFps, 4);
   state.mappedBrightness = clampBrightnessPercent(d?.brightness?.mappedPercent, 100);
   state.serverSyncLeadMs = clampSyncLeadMs(d?.mirror?.syncLeadMs, 12);
   if (d?.brightness?.tileOffsets && typeof d.brightness.tileOffsets === "object") {

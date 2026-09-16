@@ -881,11 +881,34 @@ class MirrorRuntime:
             raise RuntimeError("; ".join(errors[:3]))
 
         # Start playback as closely as possible across masters.
+        # Pre-fetch tokens before the barrier so auth refresh latency does not
+        # create visible phase offsets between devices.
         start_errors = []
+        token_by_ip = {}
+        for ip in frames_by_ip.keys():
+            token_by_ip[ip] = self._token(ip)
+
+        barrier_at = time.perf_counter() + 0.35
+
+        def wait_until(target):
+            while True:
+                remaining = target - time.perf_counter()
+                if remaining <= 0:
+                    return
+                time.sleep(min(remaining, 0.002))
 
         def timed_start(ip):
+            token = token_by_ip.get(ip)
+            wait_until(barrier_at)
             started = time.perf_counter()
-            self._set_movie_mode_for_ip(ip)
+            try:
+                self._set_led_mode(ip, token, "movie")
+            except Exception as exc:
+                if not self._is_unauthorized_error(exc):
+                    raise
+                self._tokens.pop(ip, None)
+                token = self._token(ip)
+                self._set_led_mode(ip, token, "movie")
             elapsed_ms = (time.perf_counter() - started) * 1000.0
             return elapsed_ms
 

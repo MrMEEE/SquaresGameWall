@@ -129,7 +129,7 @@ h1 {
 
 .map-sync-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 112px auto;
+  grid-template-columns: 1fr 1fr 112px 1fr 112px auto;
   gap: 10px;
   align-items: end;
   margin-bottom: 10px;
