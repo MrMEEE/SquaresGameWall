@@ -1432,24 +1432,31 @@ function withAnimationFrameSnapshot(frameIndex, fn, elapsedMs = null) {
 
 function buildServerMirrorPayload(masters) {
   const calibrationMode = Boolean(state.offsetCalibrationPatternEnabled);
+  const playbackMode = normalizeMirrorPlaybackMode(state.serverMirrorPlaybackMode);
+  const movieMode = playbackMode === "device_movie";
   const maxLeds = masters.reduce((acc, masterId) => {
     const ip = state.masterIPs[masterId];
     if (!ip) return acc;
     return Math.max(acc, estimateMasterLedCount(masterId, ip));
   }, 0);
 
-  const targetFps = calibrationMode ? 10 : (maxLeds > 4096 ? 12 : (maxLeds > 2048 ? 16 : 20));
-  const frameCount = calibrationMode ? 20 : (() => {
+  const targetFps = calibrationMode
+    ? (movieMode ? 24 : 10)
+    : (movieMode
+      ? (maxLeds > 4096 ? 20 : 24)
+      : (maxLeds > 4096 ? 12 : (maxLeds > 2048 ? 16 : 20)));
+  const frameCount = calibrationMode ? (targetFps * 2) : (() => {
     const animFrames = state.animation.frames.length;
     const animActive = state.animation.active && animFrames > 0;
     const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
     const cycleMs = animActive ? (durationMs * animFrames) : 1000;
+    const frameBudget = movieMode ? 180 : 90;
     if (animActive) {
-      return Math.max(animFrames, Math.min(90, Math.round((cycleMs / 1000) * targetFps)));
+      return Math.max(animFrames, Math.min(frameBudget, Math.round((cycleMs / 1000) * targetFps)));
     }
     return 1;
   })();
-  const fps = calibrationMode ? 10 : (() => {
+  const fps = calibrationMode ? targetFps : (() => {
     const animFrames = state.animation.frames.length;
     const animActive = state.animation.active && animFrames > 0;
     const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
@@ -1457,7 +1464,7 @@ function buildServerMirrorPayload(masters) {
     if (animActive) {
       return Math.max(1, Math.min(60, Math.round(frameCount / (cycleMs / 1000))));
     }
-    return 12;
+    return movieMode ? targetFps : 12;
   })();
 
   const neededTileIds = new Set();
@@ -1473,7 +1480,7 @@ function buildServerMirrorPayload(masters) {
   const getCalibrationTileRgb = (tileId, frameIndex) => {
     const cacheKey = `${tileId}:${frameIndex}`;
     if (calibrationTileCacheByFrame.has(cacheKey)) return calibrationTileCacheByFrame.get(cacheKey);
-    const useA = (frameIndex % 20) < 10;
+    const useA = frameIndex < Math.floor(frameCount / 2);
     const color = useA ? colorA : colorB;
     const pixels = [];
     for (let i = 0; i < LEDS_PER_TILE; i += 1) {
@@ -1518,7 +1525,7 @@ function buildServerMirrorPayload(masters) {
 
   return {
     fps,
-    playbackMode: normalizeMirrorPlaybackMode(state.serverMirrorPlaybackMode),
+    playbackMode,
     dispatchLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
     masterOffsetsMs: buildMasterOffsetsByIp(),
     adaptiveSyncEnabled: true,
@@ -2919,13 +2926,14 @@ function formatMirrorRuntimeReadout(status) {
   const fps = Number(status.fps) || 0;
   const lead = Number(status.dispatchLeadMs) || 0;
   const mode = String(status.playbackMode || "rt");
+  const movieEffectiveFps = Number(status.movieEffectiveFps) || 0;
   const frameIndex = Number(status.frameIndex) || 0;
   const adaptiveEnabled = Boolean(status.adaptiveSyncEnabled);
   const adaptiveGain = Number(status.adaptiveGain) || 0;
   const adaptiveMaxMs = Number(status.adaptiveMaxAdvanceMs) || 0;
   const burstCount = Number(status.transitionBurstCount) || 0;
   const lines = [
-    `Mirror runtime: ${running} | mode ${mode} | fps ${fps} | lead ${lead}ms | frame ${frameIndex}`,
+    `Mirror runtime: ${running} | mode ${mode} | fps ${fps} | movieFps ${movieEffectiveFps || "-"} | lead ${lead}ms | frame ${frameIndex}`,
     `adaptive:${adaptiveEnabled ? "on" : "off"} gain:${adaptiveGain} max:${adaptiveMaxMs}ms burst:${burstCount}`,
     `Push ok:${Number(status.pushOk) || 0} err:${Number(status.pushErr) || 0}`,
   ];

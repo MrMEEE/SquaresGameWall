@@ -250,6 +250,7 @@ class MirrorRuntime:
         self._playback_mode = "rt"
         self._movie_active = False
         self._movie_upload_backend = ""
+        self._movie_effective_fps = 0
         self._dispatch_seq = 0
 
     def status(self):
@@ -263,6 +264,7 @@ class MirrorRuntime:
                 "playbackMode": self._playback_mode,
                 "movieActive": bool(self._movie_active),
                 "movieUploadBackend": self._movie_upload_backend,
+                "movieEffectiveFps": int(self._movie_effective_fps or 0),
                 "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
                 "masterOffsetsMs": {ip: int(round(sec * 1000.0)) for ip, sec in self._master_offsets_s.items()},
                 "adaptiveSyncEnabled": bool(self._adaptive_sync_enabled),
@@ -446,6 +448,7 @@ class MirrorRuntime:
             self._playback_mode = "rt"
             self._movie_active = False
             self._movie_upload_backend = ""
+            self._movie_effective_fps = 0
 
             current_ips = set(self._workers.keys())
             for ip in (current_ips - active_ips):
@@ -490,10 +493,46 @@ class MirrorRuntime:
             workers = list(self._workers.values())
             self._workers = {}
             self._movie_active = False
+            self._movie_effective_fps = 0
         if thread:
             thread.join(timeout=join_timeout)
         for worker in workers:
             worker.stop(join_timeout=join_timeout)
+
+    def _movie_descriptor_and_frames(self, ip, frames_for_ip):
+        descriptor = "rgb_raw"
+        bytes_per_led = 3
+        try:
+            status, raw, _headers = self._twinkly_fetch(
+                ip,
+                "/xled/v1/gestalt",
+                method="GET",
+                timeout=1.5,
+            )
+            if status >= 200 and status < 300:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+                bpl = int(payload.get("bytes_per_led", 3) or 3)
+                if bpl == 4:
+                    descriptor = "rgbw_raw"
+                    bytes_per_led = 4
+        except Exception:
+            descriptor = "rgb_raw"
+            bytes_per_led = 3
+
+        if bytes_per_led == 3:
+            return descriptor, [bytes(f) for f in frames_for_ip]
+
+        converted = []
+        for frame in frames_for_ip:
+            out = bytearray()
+            fb = bytes(frame)
+            for i in range(0, len(fb), 3):
+                out.append(fb[i])
+                out.append(fb[i + 1])
+                out.append(fb[i + 2])
+                out.append(0)
+            converted.append(bytes(out))
+        return descriptor, converted
 
     def _set_led_mode(self, ip, token, mode):
         body = json.dumps({"mode": str(mode)}, ensure_ascii=True).encode("utf-8")
@@ -689,7 +728,7 @@ class MirrorRuntime:
             raise RuntimeError(f"{path} failed ({status})")
         self._assert_api_ok(raw, headers, path)
 
-    def _upload_movie_v2(self, ip, token, frames_bytes, leds_per_frame, frame_count, fps):
+    def _upload_movie_v2(self, ip, token, frames_bytes, leds_per_frame, frame_count, fps, descriptor_type):
         try:
             self._set_led_mode(ip, token, "rt")
         except Exception:
@@ -704,7 +743,7 @@ class MirrorRuntime:
         self._post_json(ip, "/xled/v1/movies/new", token, {
             "name": "GameWall",
             "unique_id": unique_id,
-            "descriptor_type": "rgb_raw",
+            "descriptor_type": descriptor_type,
             "leds_per_frame": int(leds_per_frame),
             "frames_number": int(frame_count),
             "fps": int(fps),
@@ -732,12 +771,13 @@ class MirrorRuntime:
             if len(frame) != len(first):
                 raise RuntimeError(f"{ip}: inconsistent frame sizes")
 
+        descriptor_type, normalized_frames = self._movie_descriptor_and_frames(ip, frames_for_ip)
         token = self._token(ip)
-        frames_bytes = b"".join(bytes(f) for f in frames_for_ip)
-        frame_count = len(frames_for_ip)
+        frames_bytes = b"".join(normalized_frames)
+        frame_count = len(normalized_frames)
 
         try:
-            self._upload_movie_v2(ip, token, frames_bytes, leds_per_frame, frame_count, fps)
+            self._upload_movie_v2(ip, token, frames_bytes, leds_per_frame, frame_count, fps, descriptor_type)
             return "v2"
         except Exception as v2_exc:
             try:
@@ -765,6 +805,18 @@ class MirrorRuntime:
         if not frames_by_ip:
             raise ValueError("no valid frames to run")
 
+        effective_fps = int(fps)
+        probed = []
+        for ip in frames_by_ip.keys():
+            try:
+                p = float(self._probe_target_fps(ip, fps))
+                if p > 0:
+                    probed.append(p)
+            except Exception:
+                pass
+        if probed:
+            effective_fps = max(1, min(60, int(round(min(probed)))))
+
         self.stop(join_timeout=1.5)
 
         import concurrent.futures
@@ -772,7 +824,7 @@ class MirrorRuntime:
         errors = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(frames_by_ip))) as pool:
             future_map = {
-                pool.submit(self._upload_movie_for_ip, ip, ip_frames, fps): ip
+                pool.submit(self._upload_movie_for_ip, ip, ip_frames, effective_fps): ip
                 for ip, ip_frames in frames_by_ip.items()
             }
             for future, ip in future_map.items():
@@ -801,7 +853,7 @@ class MirrorRuntime:
             raise RuntimeError("movie start failed: " + "; ".join(start_errors[:3]))
 
         with self._lock:
-            self._fps = int(fps)
+            self._fps = int(effective_fps)
             self._frames = []
             self._frame_index = 0
             self._workers = {}
@@ -811,6 +863,7 @@ class MirrorRuntime:
             self._playback_mode = "device_movie"
             self._movie_active = True
             self._movie_upload_backend = ",".join(sorted(set(backend_used.values())))
+            self._movie_effective_fps = int(effective_fps)
 
     def _assert_api_ok(self, raw, headers, path):
         content_type = str(headers.get("Content-Type", "")).lower()
