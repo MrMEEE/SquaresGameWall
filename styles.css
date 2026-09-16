@@ -345,7 +345,7 @@ button:disabled {
 .master-ip-row {
   margin-top: 8px;
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: 1fr;
   gap: 10px;
   align-items: end;
 }
@@ -354,11 +354,40 @@ button:disabled {
   width: 100%;
 }
 
-.master-offset-controls {
+.master-offset-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 16, 26, 0.55);
+  z-index: 1300;
   display: grid;
-  grid-template-columns: auto 86px auto;
-  gap: 6px;
+  place-items: center;
+  padding: 18px;
+}
+
+.master-offset-modal[hidden] {
+  display: none !important;
+}
+
+.master-offset-modal-card {
+  width: min(420px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fffdf9;
+  box-shadow: 0 24px 64px rgba(14, 18, 24, 0.28);
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.master-offset-modal-controls {
+  display: grid;
+  grid-template-columns: auto 96px auto;
+  gap: 8px;
   align-items: center;
+}
+
+.master-offset-modal-controls input {
+  width: 100%;
 }
 
 .discovery-panel {

@@ -272,9 +272,6 @@ const el = {
   syncLeadNumber: document.getElementById("syncLeadNumber"),
   btnOffsetCalibrationPattern: document.getElementById("btnOffsetCalibrationPattern"),
   mirrorRuntimeReadout: document.getElementById("mirrorRuntimeReadout"),
-  masterSyncOffsetNumber: document.getElementById("masterSyncOffsetNumber"),
-  btnMasterSyncOffsetMinus: document.getElementById("btnMasterSyncOffsetMinus"),
-  btnMasterSyncOffsetPlus: document.getElementById("btnMasterSyncOffsetPlus"),
   mappedBrightnessRange: document.getElementById("mappedBrightnessRange"),
   mappedBrightnessNumber: document.getElementById("mappedBrightnessNumber"),
   btnResize: document.getElementById("btnResize"),
@@ -318,8 +315,15 @@ const el = {
   btnCtxRotateTileLeft: document.getElementById("btnCtxRotateTileLeft"),
   btnCtxRotateTileRight: document.getElementById("btnCtxRotateTileRight"),
   btnCtxTileBrightness: document.getElementById("btnCtxTileBrightness"),
+  btnCtxMasterOffset: document.getElementById("btnCtxMasterOffset"),
   btnCtxMapMore: document.getElementById("btnCtxMapMore"),
   btnCtxUnmapTile: document.getElementById("btnCtxUnmapTile"),
+  masterOffsetModal: document.getElementById("masterOffsetModal"),
+  masterOffsetModalInfo: document.getElementById("masterOffsetModalInfo"),
+  masterOffsetModalNumber: document.getElementById("masterOffsetModalNumber"),
+  btnMasterOffsetNudgeMinus: document.getElementById("btnMasterOffsetNudgeMinus"),
+  btnMasterOffsetNudgePlus: document.getElementById("btnMasterOffsetNudgePlus"),
+  btnMasterOffsetOk: document.getElementById("btnMasterOffsetOk"),
   btnDetectImportSelected: document.getElementById("btnDetectImportSelected"),
   btnDetectAddAll: document.getElementById("btnDetectAddAll"),
   btnDetectSelectAll: document.getElementById("btnDetectSelectAll"),
@@ -1223,6 +1227,7 @@ function onTileClick(tileId) {
 }
 
 let tileContextMenuTileId = null;
+let masterOffsetModalTileId = null;
 
 function hideTileContextMenu() {
   tileContextMenuTileId = null;
@@ -1781,6 +1786,12 @@ function showTileContextMenu(tileId, clientX, clientY) {
     const sign = offset >= 0 ? "+" : "";
     el.btnCtxTileBrightness.textContent = `Tile Brightness Offset (${sign}${offset}%)...`;
   }
+  if (el.btnCtxMasterOffset) {
+    const offset = getMasterSyncOffsetMs(tile.id);
+    const sign = offset >= 0 ? "+" : "";
+    el.btnCtxMasterOffset.hidden = !tile.isMaster;
+    el.btnCtxMasterOffset.textContent = `Master Sync Offset (${sign}${offset}ms)...`;
+  }
   const canMapMore = (() => {
     if (!tile.isMaster) return false;
     const ip = String(state.masterIPs[tile.id] || "").trim();
@@ -1961,6 +1972,13 @@ async function mapMoreFromContextMenu() {
   } catch (err) {
     setWizardStatus(`Map More failed: ${err.message}`);
   }
+}
+
+function setMasterOffsetFromContextMenu() {
+  const tileId = Number.isInteger(tileContextMenuTileId) ? tileContextMenuTileId : null;
+  hideTileContextMenu();
+  if (!Number.isInteger(tileId)) return;
+  openMasterOffsetModalForTile(tileId);
 }
 
 function setTileBrightnessOffsetFromContextMenu() {
@@ -2756,14 +2774,22 @@ function getMasterSyncOffsetMs(masterTileId) {
   return clampMasterSyncOffsetMs(state.masterSyncOffsetsMs?.[masterTileId], 0);
 }
 
-function syncSelectedMasterOffsetControl() {
-  if (!el.masterSyncOffsetNumber) return;
-  const tile = getTileById(state.selectedTileId);
-  if (!tile || !tile.isMaster) {
-    el.masterSyncOffsetNumber.value = "0";
-    return;
+function setMasterSyncOffsetMs(masterTileId, value, options = {}) {
+  const tile = getTileById(masterTileId);
+  if (!tile || !tile.isMaster) return false;
+  const next = clampMasterSyncOffsetMs(value, getMasterSyncOffsetMs(tile.id));
+  if (next === 0) {
+    delete state.masterSyncOffsetsMs[tile.id];
+  } else {
+    state.masterSyncOffsetsMs[tile.id] = next;
   }
-  el.masterSyncOffsetNumber.value = String(getMasterSyncOffsetMs(tile.id));
+  renderTileDetails();
+  saveMapAutosave();
+  applyServerMirrorTuning();
+  if (!options.quiet) {
+    setStatus(`Master ${tile.id} sync offset set to ${next}ms.`);
+  }
+  return true;
 }
 
 function buildMasterOffsetsByIp() {
@@ -2778,33 +2804,62 @@ function buildMasterOffsetsByIp() {
   return out;
 }
 
-function setSelectedMasterOffsetMs(value) {
-  const tile = getTileById(state.selectedTileId);
-  if (!tile || !tile.isMaster) {
-    syncSelectedMasterOffsetControl();
-    return;
-  }
-  const next = clampMasterSyncOffsetMs(value, getMasterSyncOffsetMs(tile.id));
-  if (next === 0) {
-    delete state.masterSyncOffsetsMs[tile.id];
-  } else {
-    state.masterSyncOffsetsMs[tile.id] = next;
-  }
-  syncSelectedMasterOffsetControl();
-  renderTileDetails();
-  saveMapAutosave();
-  applyServerMirrorTuning();
-  setStatus(`Master ${tile.id} sync offset set to ${next}ms.`);
+function getMasterOffsetModalTile() {
+  if (!Number.isInteger(masterOffsetModalTileId)) return null;
+  const tile = getTileById(masterOffsetModalTileId);
+  if (!tile || !tile.isMaster) return null;
+  return tile;
 }
 
-function nudgeSelectedMasterOffsetMs(deltaMs) {
-  const tile = getTileById(state.selectedTileId);
-  if (!tile || !tile.isMaster) {
-    syncSelectedMasterOffsetControl();
+function refreshMasterOffsetModalUi() {
+  if (!el.masterOffsetModal || el.masterOffsetModal.hidden) return;
+  const tile = getMasterOffsetModalTile();
+  if (!tile) {
+    if (el.masterOffsetModalInfo) el.masterOffsetModalInfo.textContent = "Master no longer available.";
     return;
   }
+  const ip = String(state.masterIPs[tile.id] || "").trim();
+  const offset = getMasterSyncOffsetMs(tile.id);
+  if (el.masterOffsetModalInfo) {
+    el.masterOffsetModalInfo.textContent = `Master tile ${tile.id}${ip ? ` (${ip})` : ""}: adjust sync offset in ms.`;
+  }
+  if (el.masterOffsetModalNumber) el.masterOffsetModalNumber.value = String(offset);
+}
+
+function openMasterOffsetModalForTile(tileId) {
+  const tile = getTileById(tileId);
+  if (!tile || !tile.isMaster) {
+    setStatus("Master sync offset is only available for master tiles.");
+    return;
+  }
+  state.selectedTileId = tile.id;
+  masterOffsetModalTileId = tile.id;
+  if (!el.masterOffsetModal) return;
+  el.masterOffsetModal.hidden = false;
+  refreshMasterOffsetModalUi();
+  if (el.masterOffsetModalNumber) {
+    el.masterOffsetModalNumber.focus();
+    el.masterOffsetModalNumber.select();
+  }
+}
+
+function closeMasterOffsetModalWithOk() {
+  const tile = getMasterOffsetModalTile();
+  const tileLabel = tile ? `Master ${tile.id}` : "Master";
+  const offset = tile ? getMasterSyncOffsetMs(tile.id) : 0;
+  masterOffsetModalTileId = null;
+  if (el.masterOffsetModal) el.masterOffsetModal.hidden = true;
+  setStatus(`${tileLabel} sync offset saved at ${offset}ms.`);
+}
+
+function nudgeMasterOffsetModal(deltaMs) {
+  const tile = getMasterOffsetModalTile();
+  if (!tile) return;
   const current = getMasterSyncOffsetMs(tile.id);
-  setSelectedMasterOffsetMs(current + Number(deltaMs || 0));
+  const next = current + Number(deltaMs || 0);
+  if (setMasterSyncOffsetMs(tile.id, next, { quiet: true })) {
+    refreshMasterOffsetModalUi();
+  }
 }
 
 function setOffsetCalibrationPatternEnabled(enabled) {
@@ -4767,7 +4822,6 @@ function renderTileDetails() {
   if (state.selectedTileId == null) {
     el.tileDetails.textContent = "No tile selected.";
     el.masterIpRow.hidden = true;
-    syncSelectedMasterOffsetControl();
     updateGeneralButtonStates();
     return;
   }
@@ -4776,7 +4830,6 @@ function renderTileDetails() {
   if (!tile) {
     el.tileDetails.textContent = "No tile selected.";
     el.masterIpRow.hidden = true;
-    syncSelectedMasterOffsetControl();
     updateGeneralButtonStates();
     return;
   }
@@ -4806,10 +4859,8 @@ function renderTileDetails() {
     el.masterIpRow.hidden = false;
     el.masterIpInput.value = ip;
     el.masterIpInput.placeholder = "192.168.1.x";
-    syncSelectedMasterOffsetControl();
   } else {
     el.masterIpRow.hidden = true;
-    syncSelectedMasterOffsetControl();
   }
 
   const rot = state.tileRotations[tile.id] || 0;
@@ -7174,29 +7225,40 @@ function bindEvents() {
     updateGeneralButtonStates();
   });
 
-  if (el.masterSyncOffsetNumber) {
-    el.masterSyncOffsetNumber.addEventListener("input", () => {
-      setSelectedMasterOffsetMs(el.masterSyncOffsetNumber.value);
+  if (el.masterOffsetModalNumber) {
+    el.masterOffsetModalNumber.addEventListener("input", () => {
+      const tile = getMasterOffsetModalTile();
+      if (!tile) return;
+      setMasterSyncOffsetMs(tile.id, el.masterOffsetModalNumber.value, { quiet: true });
+      refreshMasterOffsetModalUi();
     });
-    el.masterSyncOffsetNumber.addEventListener("change", () => {
-      setSelectedMasterOffsetMs(el.masterSyncOffsetNumber.value);
+    el.masterOffsetModalNumber.addEventListener("change", () => {
+      const tile = getMasterOffsetModalTile();
+      if (!tile) return;
+      setMasterSyncOffsetMs(tile.id, el.masterOffsetModalNumber.value);
+      refreshMasterOffsetModalUi();
     });
-    el.masterSyncOffsetNumber.addEventListener("keydown", (event) => {
+    el.masterOffsetModalNumber.addEventListener("keydown", (event) => {
       if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
       event.preventDefault();
       const delta = event.key === "ArrowUp" ? 1 : -1;
       const step = event.shiftKey ? 5 : 1;
-      nudgeSelectedMasterOffsetMs(delta * step);
+      nudgeMasterOffsetModal(delta * step);
     });
   }
-  if (el.btnMasterSyncOffsetMinus) {
-    el.btnMasterSyncOffsetMinus.addEventListener("click", () => {
-      nudgeSelectedMasterOffsetMs(-1);
+  if (el.btnMasterOffsetNudgeMinus) {
+    el.btnMasterOffsetNudgeMinus.addEventListener("click", () => {
+      nudgeMasterOffsetModal(-1);
     });
   }
-  if (el.btnMasterSyncOffsetPlus) {
-    el.btnMasterSyncOffsetPlus.addEventListener("click", () => {
-      nudgeSelectedMasterOffsetMs(1);
+  if (el.btnMasterOffsetNudgePlus) {
+    el.btnMasterOffsetNudgePlus.addEventListener("click", () => {
+      nudgeMasterOffsetModal(1);
+    });
+  }
+  if (el.btnMasterOffsetOk) {
+    el.btnMasterOffsetOk.addEventListener("click", () => {
+      closeMasterOffsetModalWithOk();
     });
   }
 
@@ -7495,6 +7557,11 @@ function bindEvents() {
   if (el.btnCtxTileBrightness) {
     el.btnCtxTileBrightness.addEventListener("click", () => {
       setTileBrightnessOffsetFromContextMenu();
+    });
+  }
+  if (el.btnCtxMasterOffset) {
+    el.btnCtxMasterOffset.addEventListener("click", () => {
+      setMasterOffsetFromContextMenu();
     });
   }
   if (el.btnCtxUnmapTile) {

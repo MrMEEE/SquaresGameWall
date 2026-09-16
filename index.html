@@ -82,12 +82,6 @@
         <label>Master IP Address
           <input id="masterIpInput" type="text" placeholder="192.168.1.x" spellcheck="false" />
         </label>
-        <label>Master Sync Offset (ms)</label>
-        <div class="master-offset-controls">
-          <button id="btnMasterSyncOffsetMinus" class="secondary" type="button">-1ms</button>
-          <input id="masterSyncOffsetNumber" type="number" min="-40" max="40" step="1" value="0" />
-          <button id="btnMasterSyncOffsetPlus" class="secondary" type="button">+1ms</button>
-        </div>
       </div>
 
       <h3>Hardware Wizard</h3>
@@ -360,8 +354,24 @@
     <button id="btnCtxRotateTileLeft" type="button">Rotate Tile Left 90°</button>
     <button id="btnCtxRotateTileRight" type="button">Rotate Tile Right 90°</button>
     <button id="btnCtxTileBrightness" type="button" class="secondary">Tile Brightness Offset...</button>
+    <button id="btnCtxMasterOffset" type="button" class="secondary" hidden>Master Sync Offset...</button>
     <button id="btnCtxMapMore" type="button" class="secondary">Map More</button>
     <button id="btnCtxUnmapTile" type="button" class="danger">Unmap Tile</button>
+  </div>
+
+  <div id="masterOffsetModal" class="master-offset-modal" hidden>
+    <div class="master-offset-modal-card" role="dialog" aria-modal="true" aria-labelledby="masterOffsetModalTitle">
+      <h3 id="masterOffsetModalTitle">Master Sync Offset</h3>
+      <p id="masterOffsetModalInfo" class="hint">Adjust timing offset for this master.</p>
+      <div class="master-offset-modal-controls">
+        <button id="btnMasterOffsetNudgeMinus" class="secondary" type="button">-1ms</button>
+        <input id="masterOffsetModalNumber" type="number" min="-40" max="40" step="1" value="0" />
+        <button id="btnMasterOffsetNudgePlus" class="secondary" type="button">+1ms</button>
+      </div>
+      <div class="data-actions">
+        <button id="btnMasterOffsetOk" type="button">OK</button>
+      </div>
+    </div>
   </div>
 
   <script src="app.js?v=20260916-syncrate1"></script>
