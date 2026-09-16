@@ -1435,8 +1435,8 @@ function buildServerMirrorPayload(masters) {
     return Math.max(acc, estimateMasterLedCount(masterId, ip));
   }, 0);
 
-  const targetFps = calibrationMode ? 12 : (maxLeds > 4096 ? 16 : (maxLeds > 2048 ? 24 : 30));
-  const frameCount = calibrationMode ? 24 : (() => {
+  const targetFps = calibrationMode ? 10 : (maxLeds > 4096 ? 12 : (maxLeds > 2048 ? 16 : 20));
+  const frameCount = calibrationMode ? 20 : (() => {
     const animFrames = state.animation.frames.length;
     const animActive = state.animation.active && animFrames > 0;
     const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
@@ -1446,7 +1446,7 @@ function buildServerMirrorPayload(masters) {
     }
     return 1;
   })();
-  const fps = calibrationMode ? 12 : (() => {
+  const fps = calibrationMode ? 10 : (() => {
     const animFrames = state.animation.frames.length;
     const animActive = state.animation.active && animFrames > 0;
     const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
@@ -1470,7 +1470,7 @@ function buildServerMirrorPayload(masters) {
   const getCalibrationTileRgb = (tileId, frameIndex) => {
     const cacheKey = `${tileId}:${frameIndex}`;
     if (calibrationTileCacheByFrame.has(cacheKey)) return calibrationTileCacheByFrame.get(cacheKey);
-    const useA = (frameIndex % 24) < 12;
+    const useA = (frameIndex % 20) < 10;
     const color = useA ? colorA : colorB;
     const pixels = [];
     for (let i = 0; i < LEDS_PER_TILE; i += 1) {
@@ -1517,6 +1517,11 @@ function buildServerMirrorPayload(masters) {
     fps,
     dispatchLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
     masterOffsetsMs: buildMasterOffsetsByIp(),
+    adaptiveSyncEnabled: true,
+    adaptiveGain: 0.6,
+    adaptiveMaxAdvanceMs: 12,
+    transitionBurstCount: 2,
+    transitionBurstSpacingMs: 3,
     mode: calibrationMode ? "offset-calibration" : "render",
     frames,
   };
@@ -2886,8 +2891,13 @@ function formatMirrorRuntimeReadout(status) {
   const fps = Number(status.fps) || 0;
   const lead = Number(status.dispatchLeadMs) || 0;
   const frameIndex = Number(status.frameIndex) || 0;
+  const adaptiveEnabled = Boolean(status.adaptiveSyncEnabled);
+  const adaptiveGain = Number(status.adaptiveGain) || 0;
+  const adaptiveMaxMs = Number(status.adaptiveMaxAdvanceMs) || 0;
+  const burstCount = Number(status.transitionBurstCount) || 0;
   const lines = [
     `Mirror runtime: ${running} | fps ${fps} | lead ${lead}ms | frame ${frameIndex}`,
+    `adaptive:${adaptiveEnabled ? "on" : "off"} gain:${adaptiveGain} max:${adaptiveMaxMs}ms burst:${burstCount}`,
     `Push ok:${Number(status.pushOk) || 0} err:${Number(status.pushErr) || 0}`,
   ];
   const workers = status.workers && typeof status.workers === "object"
@@ -2911,9 +2921,12 @@ function formatMirrorRuntimeReadout(status) {
     const pushErr = Number(w?.pushErr) || 0;
     const wf = Number(w?.targetFps) || 0;
     const offsetMs = Number(w?.configuredOffsetMs) || 0;
+    const adaptiveCorrectionMs = Number(w?.lastAdaptiveCorrectionMs) || 0;
+    const avgSendMs = Number(w?.avgSendMs) || 0;
+    const jitterMs = Number(w?.jitterMs) || 0;
     const pushMs = Date.parse(String(w?.lastPushAt || ""));
     const lagMs = newestPushMs && Number.isFinite(pushMs) ? Math.max(0, newestPushMs - pushMs) : 0;
-    lines.push(`- ${ip} fps:${wf} off:${offsetMs}ms ok:${pushOk} err:${pushErr} lag:${Math.round(lagMs)}ms`);
+    lines.push(`- ${ip} fps:${wf} off:${offsetMs}ms adapt:${Math.round(adaptiveCorrectionMs)}ms send:${avgSendMs.toFixed(1)}+/-${jitterMs.toFixed(1)} lag:${Math.round(lagMs)}ms ok:${pushOk} err:${pushErr}`);
   }
   return lines.join("\n");
 }

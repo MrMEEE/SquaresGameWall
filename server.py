@@ -44,6 +44,9 @@ class MirrorRuntime:
             self._configured_offset_s = 0.0
             self._last_frame_seq = 0
             self._last_dispatch_skew_ms = 0.0
+            self._last_adaptive_correction_ms = 0.0
+            self._ewma_send_ms = 0.0
+            self._ewma_jitter_ms = 0.0
             self.push_ok = 0
             self.push_err = 0
             self.last_push_at = ""
@@ -63,7 +66,7 @@ class MirrorRuntime:
             if thread:
                 thread.join(timeout=join_timeout)
 
-        def submit(self, frame_bytes, target_at=None, frame_seq=0):
+        def submit(self, frame_bytes, target_at=None, frame_seq=0, burst_count=0, burst_spacing_ms=3, adaptive_correction_ms=0.0):
             if not isinstance(frame_bytes, (bytes, bytearray)) or len(frame_bytes) < 3:
                 return
             with self._lock:
@@ -72,6 +75,9 @@ class MirrorRuntime:
                     "frameBytes": bytes(frame_bytes),
                     "targetAt": float(target_at) if target_at is not None else None,
                     "frameSeq": int(frame_seq),
+                    "burstCount": max(0, min(3, int(burst_count or 0))),
+                    "burstSpacingMs": max(0, min(12, int(burst_spacing_ms or 3))),
+                    "adaptiveCorrectionMs": float(adaptive_correction_ms or 0.0),
                 }
             self._event.set()
 
@@ -102,11 +108,31 @@ class MirrorRuntime:
                     "configuredOffsetMs": int(round(self._configured_offset_s * 1000.0)),
                     "lastFrameSeq": int(self._last_frame_seq),
                     "lastDispatchSkewMs": round(float(self._last_dispatch_skew_ms), 2),
+                    "lastAdaptiveCorrectionMs": round(float(self._last_adaptive_correction_ms), 2),
+                    "avgSendMs": round(float(self._ewma_send_ms), 2),
+                    "jitterMs": round(float(self._ewma_jitter_ms), 2),
                     "pushOk": self.push_ok,
                     "pushErr": self.push_err,
                     "lastPushAt": self.last_push_at,
                     "lastError": self.last_error,
                 }
+
+        def get_send_ewma_ms(self):
+            with self._lock:
+                return float(self._ewma_send_ms)
+
+        def _record_send_timing(self, elapsed_ms):
+            value = max(0.0, float(elapsed_ms or 0.0))
+            alpha = 0.24
+            with self._lock:
+                if self._ewma_send_ms <= 0.0:
+                    self._ewma_send_ms = value
+                    self._ewma_jitter_ms = 0.0
+                    return
+                previous = self._ewma_send_ms
+                self._ewma_send_ms = (alpha * value) + ((1.0 - alpha) * previous)
+                deviation = abs(value - previous)
+                self._ewma_jitter_ms = (alpha * deviation) + ((1.0 - alpha) * self._ewma_jitter_ms)
 
         def _take_pending(self):
             with self._lock:
@@ -174,10 +200,22 @@ class MirrorRuntime:
                     skew_ms = 0.0
                     if isinstance(target_at, (int, float)):
                         skew_ms = (time.perf_counter() - float(target_at)) * 1000.0
+                    burst_count = max(0, min(3, int(pending.get("burstCount") or 0)))
+                    burst_spacing_s = max(0.0, min(0.012, float(int(pending.get("burstSpacingMs") or 3)) / 1000.0))
+                    adaptive_correction_ms = float(pending.get("adaptiveCorrectionMs") or 0.0)
                     with self._lock:
                         self._last_frame_seq = int(pending.get("frameSeq") or 0)
                         self._last_dispatch_skew_ms = skew_ms
+                        self._last_adaptive_correction_ms = adaptive_correction_ms
+
+                    started = time.perf_counter()
                     self.runtime._push_rt_frame(self.ip, pending["frameBytes"])
+                    for _ in range(burst_count):
+                        if self._stop_event.wait(burst_spacing_s):
+                            return
+                        self.runtime._push_rt_frame(self.ip, pending["frameBytes"])
+                    send_elapsed_ms = (time.perf_counter() - started) * 1000.0
+                    self._record_send_timing(send_elapsed_ms)
                     with self._lock:
                         self._next_allowed_at = time.perf_counter() + self._min_interval_s
                     self._record_ok()
@@ -202,6 +240,12 @@ class MirrorRuntime:
         self._push_err = 0
         self._dispatch_lead_s = 0.012
         self._master_offsets_s = {}
+        self._adaptive_sync_enabled = True
+        self._adaptive_gain = 0.6
+        self._adaptive_max_advance_s = 0.012
+        self._transition_burst_count = 2
+        self._transition_burst_spacing_s = 0.003
+        self._last_frame_signature_by_ip = {}
         self._dispatch_seq = 0
 
     def status(self):
@@ -214,6 +258,11 @@ class MirrorRuntime:
                 "frameIndex": self._frame_index,
                 "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
                 "masterOffsetsMs": {ip: int(round(sec * 1000.0)) for ip, sec in self._master_offsets_s.items()},
+                "adaptiveSyncEnabled": bool(self._adaptive_sync_enabled),
+                "adaptiveGain": round(float(self._adaptive_gain), 3),
+                "adaptiveMaxAdvanceMs": int(round(self._adaptive_max_advance_s * 1000.0)),
+                "transitionBurstCount": int(self._transition_burst_count),
+                "transitionBurstSpacingMs": int(round(self._transition_burst_spacing_s * 1000.0)),
                 "workers": worker_snaps,
                 "lastPushAt": self._last_push_at,
                 "lastError": self._last_error,
@@ -221,7 +270,16 @@ class MirrorRuntime:
                 "pushErr": self._push_err,
             }
 
-    def set_tuning(self, dispatch_lead_ms=None, master_offsets_ms=None):
+    def set_tuning(
+        self,
+        dispatch_lead_ms=None,
+        master_offsets_ms=None,
+        adaptive_sync_enabled=None,
+        adaptive_gain=None,
+        adaptive_max_advance_ms=None,
+        transition_burst_count=None,
+        transition_burst_spacing_ms=None,
+    ):
         if dispatch_lead_ms is None:
             lead = None
         else:
@@ -242,11 +300,57 @@ class MirrorRuntime:
                 offset = max(-40.0, min(40.0, offset))
                 parsed_offsets[ip] = offset / 1000.0
 
+        adaptive_enabled = None
+        if isinstance(adaptive_sync_enabled, bool):
+            adaptive_enabled = adaptive_sync_enabled
+
+        gain = None
+        if adaptive_gain is not None:
+            try:
+                gain = float(adaptive_gain)
+            except Exception:
+                gain = 0.6
+            gain = max(0.0, min(1.2, gain))
+
+        max_advance_s = None
+        if adaptive_max_advance_ms is not None:
+            try:
+                max_advance_s = float(adaptive_max_advance_ms) / 1000.0
+            except Exception:
+                max_advance_s = 0.012
+            max_advance_s = max(0.0, min(0.03, max_advance_s))
+
+        burst_count = None
+        if transition_burst_count is not None:
+            try:
+                burst_count = int(transition_burst_count)
+            except Exception:
+                burst_count = 2
+            burst_count = max(0, min(3, burst_count))
+
+        burst_spacing_s = None
+        if transition_burst_spacing_ms is not None:
+            try:
+                burst_spacing_s = float(transition_burst_spacing_ms) / 1000.0
+            except Exception:
+                burst_spacing_s = 0.003
+            burst_spacing_s = max(0.0, min(0.012, burst_spacing_s))
+
         with self._lock:
             if lead is not None:
                 self._dispatch_lead_s = lead / 1000.0
             if parsed_offsets is not None:
                 self._master_offsets_s = parsed_offsets
+            if adaptive_enabled is not None:
+                self._adaptive_sync_enabled = adaptive_enabled
+            if gain is not None:
+                self._adaptive_gain = gain
+            if max_advance_s is not None:
+                self._adaptive_max_advance_s = max_advance_s
+            if burst_count is not None:
+                self._transition_burst_count = burst_count
+            if burst_spacing_s is not None:
+                self._transition_burst_spacing_s = burst_spacing_s
             current_offsets = dict(self._master_offsets_s)
             workers = list(self._workers.items())
 
@@ -325,6 +429,7 @@ class MirrorRuntime:
             self._push_ok = 0
             self._push_err = 0
             self._dispatch_seq = 0
+            self._last_frame_signature_by_ip = {}
 
             current_ips = set(self._workers.keys())
             for ip in (current_ips - active_ips):
@@ -386,9 +491,32 @@ class MirrorRuntime:
                 workers = dict(self._workers)
                 frame_seq = self._dispatch_seq
                 self._dispatch_seq += 1
+                offsets = dict(self._master_offsets_s)
+                adaptive_enabled = bool(self._adaptive_sync_enabled)
+                adaptive_gain = float(self._adaptive_gain)
+                adaptive_max_advance_s = float(self._adaptive_max_advance_s)
+                burst_count = int(self._transition_burst_count)
+                burst_spacing_s = float(self._transition_burst_spacing_s)
+                last_sig = dict(self._last_frame_signature_by_ip)
 
             started = time.perf_counter()
             target_at = started + self._dispatch_lead_s
+
+            send_ewma_by_ip = {}
+            baseline_send_ms = 0.0
+            if adaptive_enabled:
+                for master in frame.get("masters", []):
+                    ip = master.get("ip")
+                    worker = workers.get(ip)
+                    if not worker:
+                        continue
+                    ewma_ms = worker.get_send_ewma_ms()
+                    if ewma_ms > 0.0:
+                        send_ewma_by_ip[ip] = ewma_ms
+                if send_ewma_by_ip:
+                    baseline_send_ms = min(send_ewma_by_ip.values())
+
+            next_signatures = {}
             for master in frame.get("masters", []):
                 ip = master.get("ip")
                 frame_bytes = master.get("frameBytes")
@@ -396,8 +524,33 @@ class MirrorRuntime:
                     continue
                 worker = workers.get(ip)
                 if worker:
-                    offset_s = float(self._master_offsets_s.get(ip, 0.0))
-                    worker.submit(frame_bytes, target_at=(target_at + offset_s), frame_seq=frame_seq)
+                    offset_s = float(offsets.get(ip, 0.0))
+                    adaptive_correction_s = 0.0
+                    if adaptive_enabled and baseline_send_ms > 0.0:
+                        this_send_ms = float(send_ewma_by_ip.get(ip, 0.0))
+                        if this_send_ms > baseline_send_ms:
+                            adaptive_correction_s = min(
+                                adaptive_max_advance_s,
+                                ((this_send_ms - baseline_send_ms) / 1000.0) * adaptive_gain,
+                            )
+
+                    signature = bytes(frame_bytes)
+                    changed = last_sig.get(ip) != signature
+                    next_signatures[ip] = signature
+                    worker.submit(
+                        frame_bytes,
+                        target_at=(target_at + offset_s - adaptive_correction_s),
+                        frame_seq=frame_seq,
+                        burst_count=(burst_count if changed else 0),
+                        burst_spacing_ms=int(round(burst_spacing_s * 1000.0)),
+                        adaptive_correction_ms=(adaptive_correction_s * 1000.0),
+                    )
+
+            with self._lock:
+                self._last_frame_signature_by_ip = {
+                    **{ip: sig for ip, sig in self._last_frame_signature_by_ip.items() if ip in workers},
+                    **next_signatures,
+                }
 
             interval = 1.0 / max(1, fps)
             elapsed = time.perf_counter() - started
@@ -1235,6 +1388,11 @@ class GameWallHandler(SimpleHTTPRequestHandler):
         fps = payload.get("fps", 20)
         dispatch_lead_ms = payload.get("dispatchLeadMs", None)
         master_offsets_ms = payload.get("masterOffsetsMs", None)
+        adaptive_sync_enabled = payload.get("adaptiveSyncEnabled", None)
+        adaptive_gain = payload.get("adaptiveGain", None)
+        adaptive_max_advance_ms = payload.get("adaptiveMaxAdvanceMs", None)
+        transition_burst_count = payload.get("transitionBurstCount", None)
+        transition_burst_spacing_ms = payload.get("transitionBurstSpacingMs", None)
         frames = payload.get("frames") if isinstance(payload, dict) else None
         if not isinstance(frames, list) or not frames:
             self._json_response(400, {"error": "frames[] is required"})
@@ -1267,7 +1425,15 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            MIRROR_RUNTIME.set_tuning(dispatch_lead_ms=dispatch_lead_ms, master_offsets_ms=master_offsets_ms)
+            MIRROR_RUNTIME.set_tuning(
+                dispatch_lead_ms=dispatch_lead_ms,
+                master_offsets_ms=master_offsets_ms,
+                adaptive_sync_enabled=adaptive_sync_enabled,
+                adaptive_gain=adaptive_gain,
+                adaptive_max_advance_ms=adaptive_max_advance_ms,
+                transition_burst_count=transition_burst_count,
+                transition_burst_spacing_ms=transition_burst_spacing_ms,
+            )
             MIRROR_RUNTIME.start(parsed_frames, fps=fps)
         except Exception as exc:
             self._json_response(400, {"error": str(exc)})
@@ -1284,8 +1450,21 @@ class GameWallHandler(SimpleHTTPRequestHandler):
 
         dispatch_lead_ms = payload.get("dispatchLeadMs", None) if isinstance(payload, dict) else None
         master_offsets_ms = payload.get("masterOffsetsMs", None) if isinstance(payload, dict) else None
+        adaptive_sync_enabled = payload.get("adaptiveSyncEnabled", None) if isinstance(payload, dict) else None
+        adaptive_gain = payload.get("adaptiveGain", None) if isinstance(payload, dict) else None
+        adaptive_max_advance_ms = payload.get("adaptiveMaxAdvanceMs", None) if isinstance(payload, dict) else None
+        transition_burst_count = payload.get("transitionBurstCount", None) if isinstance(payload, dict) else None
+        transition_burst_spacing_ms = payload.get("transitionBurstSpacingMs", None) if isinstance(payload, dict) else None
         try:
-            MIRROR_RUNTIME.set_tuning(dispatch_lead_ms=dispatch_lead_ms, master_offsets_ms=master_offsets_ms)
+            MIRROR_RUNTIME.set_tuning(
+                dispatch_lead_ms=dispatch_lead_ms,
+                master_offsets_ms=master_offsets_ms,
+                adaptive_sync_enabled=adaptive_sync_enabled,
+                adaptive_gain=adaptive_gain,
+                adaptive_max_advance_ms=adaptive_max_advance_ms,
+                transition_burst_count=transition_burst_count,
+                transition_burst_spacing_ms=transition_burst_spacing_ms,
+            )
         except Exception as exc:
             self._json_response(400, {"error": str(exc)})
             return
