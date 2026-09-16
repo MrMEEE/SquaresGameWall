@@ -701,6 +701,23 @@ class MirrorRuntime:
             return cached.get("token")
         return self._login(ip)
 
+    def _is_unauthorized_error(self, exc):
+        if isinstance(exc, urllib.error.HTTPError):
+            return int(getattr(exc, "code", 0) or 0) == 401
+        text = str(exc)
+        return "401" in text and "Unauthorized" in text
+
+    def _call_with_token_retry(self, ip, token_action):
+        token = self._token(ip)
+        try:
+            return token_action(token)
+        except Exception as exc:
+            if not self._is_unauthorized_error(exc):
+                raise
+            self._tokens.pop(ip, None)
+            token = self._token(ip)
+            return token_action(token)
+
     def _set_rt_mode(self, ip, token):
         self._set_led_mode(ip, token, "rt")
 
@@ -788,23 +805,27 @@ class MirrorRuntime:
                 raise RuntimeError(f"{ip}: inconsistent frame sizes")
 
         descriptor_type, normalized_frames = self._movie_descriptor_and_frames(ip, frames_for_ip)
-        token = self._token(ip)
         frames_bytes = b"".join(normalized_frames)
         frame_count = len(normalized_frames)
 
-        try:
-            self._upload_movie_v2(ip, token, frames_bytes, leds_per_frame, frame_count, fps, descriptor_type)
-            return "v2"
-        except Exception as v2_exc:
+        def do_upload(token):
             try:
-                self._upload_movie_legacy(ip, token, frames_bytes, leds_per_frame, frame_count, fps)
-                return "legacy"
-            except Exception as legacy_exc:
-                raise RuntimeError(f"{ip}: movie upload failed (v2: {v2_exc}; legacy: {legacy_exc})")
+                self._upload_movie_v2(ip, token, frames_bytes, leds_per_frame, frame_count, fps, descriptor_type)
+                return "v2"
+            except Exception as v2_exc:
+                try:
+                    self._upload_movie_legacy(ip, token, frames_bytes, leds_per_frame, frame_count, fps)
+                    return "legacy"
+                except Exception as legacy_exc:
+                    raise RuntimeError(f"{ip}: movie upload failed (v2: {v2_exc}; legacy: {legacy_exc})")
+
+        return self._call_with_token_retry(ip, do_upload)
 
     def _set_movie_mode_for_ip(self, ip):
-        token = self._token(ip)
-        self._set_led_mode(ip, token, "movie")
+        def do_set_mode(token):
+            self._set_led_mode(ip, token, "movie")
+            return True
+        self._call_with_token_retry(ip, do_set_mode)
 
     def _start_device_movie(self, frames, fps):
         if not isinstance(frames, list) or not frames:
@@ -997,7 +1018,12 @@ class MirrorRuntime:
         refresh = (time.time() - float(self._rt_mode_at.get(ip, 0) or 0)) > 20
         if refresh:
             mode_started = time.perf_counter()
-            self._set_rt_mode(ip, token)
+
+            def do_set_mode(rt_token):
+                self._set_rt_mode(ip, rt_token)
+                return rt_token
+
+            token = self._call_with_token_retry(ip, do_set_mode)
             self._rt_mode_at[ip] = time.time()
             self._rt_mode_switch_ms_by_ip[ip] = (time.perf_counter() - mode_started) * 1000.0
 
