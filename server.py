@@ -251,6 +251,9 @@ class MirrorRuntime:
         self._movie_active = False
         self._movie_upload_backend = ""
         self._movie_effective_fps = 0
+        self._movie_upload_ms_by_ip = {}
+        self._movie_start_ms_by_ip = {}
+        self._rt_mode_switch_ms_by_ip = {}
         self._dispatch_seq = 0
 
     def status(self):
@@ -265,6 +268,9 @@ class MirrorRuntime:
                 "movieActive": bool(self._movie_active),
                 "movieUploadBackend": self._movie_upload_backend,
                 "movieEffectiveFps": int(self._movie_effective_fps or 0),
+                "movieUploadMsByIp": {ip: round(float(ms), 2) for ip, ms in self._movie_upload_ms_by_ip.items()},
+                "movieStartMsByIp": {ip: round(float(ms), 2) for ip, ms in self._movie_start_ms_by_ip.items()},
+                "rtModeSwitchMsByIp": {ip: round(float(ms), 2) for ip, ms in self._rt_mode_switch_ms_by_ip.items()},
                 "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
                 "masterOffsetsMs": {ip: int(round(sec * 1000.0)) for ip, sec in self._master_offsets_s.items()},
                 "adaptiveSyncEnabled": bool(self._adaptive_sync_enabled),
@@ -378,11 +384,26 @@ class MirrorRuntime:
             if status < 200 or status >= 300:
                 return target
             payload = json.loads(raw.decode("utf-8") or "{}")
-            measured = payload.get("measured_frame_rate", payload.get("frame_rate"))
-            measured_fps = float(measured)
-            if measured_fps <= 0:
+            # Prefer capability-style FPS fields over measured runtime FPS.
+            # measured_frame_rate can transiently drop very low (e.g. ~1) and
+            # should not cap requested playback for mirror startup.
+            fps_candidate = None
+            for key in ("frame_rate", "max_supported_fps", "measured_frame_rate"):
+                value = payload.get(key)
+                try:
+                    parsed = float(value)
+                except Exception:
+                    continue
+                if parsed <= 0:
+                    continue
+                # Ignore implausibly low measured runtime values as a hard cap.
+                if key == "measured_frame_rate" and parsed < 5.0:
+                    continue
+                fps_candidate = parsed
+                break
+            if fps_candidate is None:
                 return target
-            return min(target, max(1.0, min(60.0, measured_fps)))
+            return min(target, max(1.0, min(60.0, fps_candidate)))
         except Exception:
             return target
 
@@ -449,6 +470,11 @@ class MirrorRuntime:
             self._movie_active = False
             self._movie_upload_backend = ""
             self._movie_effective_fps = 0
+            self._movie_upload_ms_by_ip = {}
+            self._movie_start_ms_by_ip = {}
+            # Force an explicit RT mode switch on the next push after any
+            # prior mode changes (especially returning from device movie mode).
+            self._rt_mode_at = {}
 
             current_ips = set(self._workers.keys())
             for ip in (current_ips - active_ips):
@@ -825,15 +851,26 @@ class MirrorRuntime:
 
         import concurrent.futures
         backend_used = {}
+        upload_ms_by_ip = {}
+        start_ms_by_ip = {}
         errors = []
+
+        def timed_upload(ip, ip_frames, fps_value):
+            started = time.perf_counter()
+            backend = self._upload_movie_for_ip(ip, ip_frames, fps_value)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            return backend, elapsed_ms
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(frames_by_ip))) as pool:
             future_map = {
-                pool.submit(self._upload_movie_for_ip, ip, ip_frames, effective_fps): ip
+                pool.submit(timed_upload, ip, ip_frames, effective_fps): ip
                 for ip, ip_frames in frames_by_ip.items()
             }
             for future, ip in future_map.items():
                 try:
-                    backend_used[ip] = future.result(timeout=45)
+                    backend, elapsed_ms = future.result(timeout=45)
+                    backend_used[ip] = backend
+                    upload_ms_by_ip[ip] = elapsed_ms
                 except Exception as exc:
                     errors.append(str(exc))
 
@@ -842,14 +879,21 @@ class MirrorRuntime:
 
         # Start playback as closely as possible across masters.
         start_errors = []
+
+        def timed_start(ip):
+            started = time.perf_counter()
+            self._set_movie_mode_for_ip(ip)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            return elapsed_ms
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(frames_by_ip))) as pool:
             future_map = {
-                pool.submit(self._set_movie_mode_for_ip, ip): ip
+                pool.submit(timed_start, ip): ip
                 for ip in frames_by_ip.keys()
             }
             for future, ip in future_map.items():
                 try:
-                    future.result(timeout=8)
+                    start_ms_by_ip[ip] = float(future.result(timeout=8))
                 except Exception as exc:
                     start_errors.append(f"{ip}: {exc}")
 
@@ -868,6 +912,8 @@ class MirrorRuntime:
             self._movie_active = True
             self._movie_upload_backend = ",".join(sorted(set(backend_used.values())))
             self._movie_effective_fps = int(effective_fps)
+            self._movie_upload_ms_by_ip = upload_ms_by_ip
+            self._movie_start_ms_by_ip = start_ms_by_ip
 
     def _assert_api_ok(self, raw, headers, path):
         content_type = str(headers.get("Content-Type", "")).lower()
@@ -900,8 +946,10 @@ class MirrorRuntime:
         token = self._token(ip)
         refresh = (time.time() - float(self._rt_mode_at.get(ip, 0) or 0)) > 20
         if refresh:
+            mode_started = time.perf_counter()
             self._set_rt_mode(ip, token)
             self._rt_mode_at[ip] = time.time()
+            self._rt_mode_switch_ms_by_ip[ip] = (time.perf_counter() - mode_started) * 1000.0
 
         prefixed = bytes([1]) + bytes(frame_bytes)
         cached = self._rt_frame_format.get(ip, "")
@@ -932,8 +980,10 @@ class MirrorRuntime:
             self._tokens.pop(ip, None)
             self._rt_frame_format.pop(ip, None)
             token = self._token(ip)
+            mode_started = time.perf_counter()
             self._set_rt_mode(ip, token)
             self._rt_mode_at[ip] = time.time()
+            self._rt_mode_switch_ms_by_ip[ip] = (time.perf_counter() - mode_started) * 1000.0
             try:
                 send_with_format("v1")
                 self._rt_frame_format[ip] = "v1"

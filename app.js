@@ -2932,6 +2932,15 @@ function formatMirrorRuntimeReadout(status) {
   const adaptiveGain = Number(status.adaptiveGain) || 0;
   const adaptiveMaxMs = Number(status.adaptiveMaxAdvanceMs) || 0;
   const burstCount = Number(status.transitionBurstCount) || 0;
+  const movieUploadMsByIp = status.movieUploadMsByIp && typeof status.movieUploadMsByIp === "object"
+    ? status.movieUploadMsByIp
+    : {};
+  const movieStartMsByIp = status.movieStartMsByIp && typeof status.movieStartMsByIp === "object"
+    ? status.movieStartMsByIp
+    : {};
+  const rtModeSwitchMsByIp = status.rtModeSwitchMsByIp && typeof status.rtModeSwitchMsByIp === "object"
+    ? status.rtModeSwitchMsByIp
+    : {};
   const lines = [
     `Mirror runtime: ${running} | mode ${mode} | fps ${fps} | movieFps ${movieEffectiveFps || "-"} | lead ${lead}ms | frame ${frameIndex}`,
     `adaptive:${adaptiveEnabled ? "on" : "off"} gain:${adaptiveGain} max:${adaptiveMaxMs}ms burst:${burstCount}`,
@@ -2961,9 +2970,17 @@ function formatMirrorRuntimeReadout(status) {
     const adaptiveCorrectionMs = Number(w?.lastAdaptiveCorrectionMs) || 0;
     const avgSendMs = Number(w?.avgSendMs) || 0;
     const jitterMs = Number(w?.jitterMs) || 0;
+    const uploadMs = Number(movieUploadMsByIp[ip]) || 0;
+    const startMs = Number(movieStartMsByIp[ip]) || 0;
+    const rtModeMs = Number(rtModeSwitchMsByIp[ip]) || 0;
     const pushMs = Date.parse(String(w?.lastPushAt || ""));
     const lagMs = newestPushMs && Number.isFinite(pushMs) ? Math.max(0, newestPushMs - pushMs) : 0;
-    lines.push(`- ${ip} fps:${wf} off:${offsetMs}ms adapt:${Math.round(adaptiveCorrectionMs)}ms send:${avgSendMs.toFixed(1)}+/-${jitterMs.toFixed(1)} lag:${Math.round(lagMs)}ms ok:${pushOk} err:${pushErr}`);
+    const movieBits = [];
+    if (uploadMs > 0) movieBits.push(`up:${uploadMs.toFixed(0)}ms`);
+    if (startMs > 0) movieBits.push(`start:${startMs.toFixed(0)}ms`);
+    if (rtModeMs > 0) movieBits.push(`rtMode:${rtModeMs.toFixed(0)}ms`);
+    const movieTiming = movieBits.length ? ` ${movieBits.join(" ")}` : "";
+    lines.push(`- ${ip} fps:${wf} off:${offsetMs}ms adapt:${Math.round(adaptiveCorrectionMs)}ms send:${avgSendMs.toFixed(1)}+/-${jitterMs.toFixed(1)} lag:${Math.round(lagMs)}ms ok:${pushOk} err:${pushErr}${movieTiming}`);
   }
   return lines.join("\n");
 }
