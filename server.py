@@ -259,6 +259,10 @@ class MirrorRuntime:
         self._movie_sync_id = ""
         self._movie_sync_config_by_ip = {}
         self._movie_sync_negotiation = ""
+        self._movie_resync_interval_s = 1.0
+        self._movie_resync_count = 0
+        self._movie_last_resync_at = ""
+        self._movie_last_resync_error = ""
         self._rt_mode_switch_ms_by_ip = {}
         self._dispatch_seq = 0
 
@@ -280,6 +284,10 @@ class MirrorRuntime:
                 "movieSyncId": self._movie_sync_id,
                 "movieSyncConfigByIp": self._movie_sync_config_by_ip,
                 "movieSyncNegotiation": self._movie_sync_negotiation,
+                "movieResyncIntervalMs": int(round(self._movie_resync_interval_s * 1000.0)),
+                "movieResyncCount": int(self._movie_resync_count),
+                "movieLastResyncAt": self._movie_last_resync_at,
+                "movieLastResyncError": self._movie_last_resync_error,
                 "rtModeSwitchMsByIp": {ip: round(float(ms), 2) for ip, ms in self._rt_mode_switch_ms_by_ip.items()},
                 "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
                 "masterOffsetsMs": {ip: int(round(sec * 1000.0)) for ip, sec in self._master_offsets_s.items()},
@@ -474,6 +482,9 @@ class MirrorRuntime:
             self._movie_sync_id = ""
             self._movie_sync_config_by_ip = {}
             self._movie_sync_negotiation = ""
+            self._movie_resync_count = 0
+            self._movie_last_resync_at = ""
+            self._movie_last_resync_error = ""
             # Force an explicit RT mode switch on the next push after any
             # prior mode changes (especially returning from device movie mode).
             self._rt_mode_at = {}
@@ -524,6 +535,9 @@ class MirrorRuntime:
             self._movie_effective_fps = 0
             self._movie_sync_config_by_ip = {}
             self._movie_sync_negotiation = ""
+            self._movie_resync_count = 0
+            self._movie_last_resync_at = ""
+            self._movie_last_resync_error = ""
         if thread:
             thread.join(timeout=join_timeout)
         for worker in workers:
@@ -924,6 +938,71 @@ class MirrorRuntime:
         add_candidate(ip)
         return candidates
 
+    def _barrier_set_movie_mode(self, ips):
+        import concurrent.futures
+
+        token_by_ip = {}
+        for ip in ips:
+            token_by_ip[ip] = self._token(ip)
+
+        barrier_at = time.perf_counter() + 0.22
+
+        def wait_until(target):
+            while True:
+                remaining = target - time.perf_counter()
+                if remaining <= 0:
+                    return
+                time.sleep(min(remaining, 0.002))
+
+        def timed_start(ip):
+            token = token_by_ip.get(ip)
+            wait_until(barrier_at)
+            started = time.perf_counter()
+            try:
+                self._set_led_mode(ip, token, "movie")
+            except Exception as exc:
+                if not self._is_unauthorized_error(exc):
+                    raise
+                self._tokens.pop(ip, None)
+                token = self._token(ip)
+                self._set_led_mode(ip, token, "movie")
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            return elapsed_ms
+
+        start_ms_by_ip = {}
+        start_errors = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ips))) as pool:
+            future_map = {
+                pool.submit(timed_start, ip): ip
+                for ip in ips
+            }
+            for future, ip in future_map.items():
+                try:
+                    start_ms_by_ip[ip] = float(future.result(timeout=8))
+                except Exception as exc:
+                    start_errors.append(f"{ip}: {exc}")
+
+        if start_errors:
+            raise RuntimeError("movie start failed: " + "; ".join(start_errors[:3]))
+
+        return start_ms_by_ip
+
+    def _movie_resync_loop(self, ips):
+        if not ips:
+            return
+        interval_s = max(0.6, float(self._movie_resync_interval_s or 1.0))
+        while not self._stop_event.wait(interval_s):
+            try:
+                start_ms_by_ip = self._barrier_set_movie_mode(ips)
+                with self._lock:
+                    self._movie_start_ms_by_ip = start_ms_by_ip
+                    self._movie_resync_count += 1
+                    self._movie_last_resync_at = _now_iso()
+                    self._movie_last_resync_error = ""
+            except Exception as exc:
+                with self._lock:
+                    self._movie_last_resync_error = str(exc)
+
     def _start_device_movie(self, frames, fps):
         if not isinstance(frames, list) or not frames:
             raise ValueError("frames must be a non-empty list")
@@ -1052,57 +1131,15 @@ class MirrorRuntime:
             self._movie_sync_negotiation = "verified"
 
         # Start playback as closely as possible across masters.
-        # Pre-fetch tokens before the barrier so auth refresh latency does not
-        # create visible phase offsets between devices.
-        start_errors = []
-        token_by_ip = {}
-        for ip in frames_by_ip.keys():
-            token_by_ip[ip] = self._token(ip)
-
-        barrier_at = time.perf_counter() + 0.35
-
-        def wait_until(target):
-            while True:
-                remaining = target - time.perf_counter()
-                if remaining <= 0:
-                    return
-                time.sleep(min(remaining, 0.002))
-
-        def timed_start(ip):
-            token = token_by_ip.get(ip)
-            wait_until(barrier_at)
-            started = time.perf_counter()
-            try:
-                self._set_led_mode(ip, token, "movie")
-            except Exception as exc:
-                if not self._is_unauthorized_error(exc):
-                    raise
-                self._tokens.pop(ip, None)
-                token = self._token(ip)
-                self._set_led_mode(ip, token, "movie")
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            return elapsed_ms
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(frames_by_ip))) as pool:
-            future_map = {
-                pool.submit(timed_start, ip): ip
-                for ip in frames_by_ip.keys()
-            }
-            for future, ip in future_map.items():
-                try:
-                    start_ms_by_ip[ip] = float(future.result(timeout=8))
-                except Exception as exc:
-                    start_errors.append(f"{ip}: {exc}")
-
-        if start_errors:
-            raise RuntimeError("movie start failed: " + "; ".join(start_errors[:3]))
+        movie_ips = list(frames_by_ip.keys())
+        start_ms_by_ip = self._barrier_set_movie_mode(movie_ips)
 
         with self._lock:
             self._fps = int(effective_fps)
             self._frames = []
             self._frame_index = 0
             self._workers = {}
-            self._thread = None
+            self._thread = threading.Thread(target=self._movie_resync_loop, args=(movie_ips,), daemon=True)
             self._stop_event = threading.Event()
             self._running = True
             self._playback_mode = "device_movie"
@@ -1112,6 +1149,14 @@ class MirrorRuntime:
             self._movie_upload_ms_by_ip = upload_ms_by_ip
             self._movie_start_ms_by_ip = start_ms_by_ip
             self._movie_sync_config_by_ip = dict(sync_config_by_ip)
+            self._movie_resync_count = 0
+            self._movie_last_resync_at = ""
+            self._movie_last_resync_error = ""
+
+            thread = self._thread
+
+        if thread:
+            thread.start()
 
     def _assert_api_ok(self, raw, headers, path):
         content_type = str(headers.get("Content-Type", "")).lower()

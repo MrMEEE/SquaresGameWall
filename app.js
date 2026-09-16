@@ -2966,6 +2966,10 @@ function formatMirrorRuntimeReadout(status) {
   const movieSyncMasterIp = String(status.movieSyncMasterIp || "").trim();
   const movieSyncId = String(status.movieSyncId || "").trim();
   const movieSyncNegotiation = String(status.movieSyncNegotiation || "").trim();
+  const movieResyncIntervalMs = Number(status.movieResyncIntervalMs) || 0;
+  const movieResyncCount = Number(status.movieResyncCount) || 0;
+  const movieLastResyncAt = String(status.movieLastResyncAt || "").trim();
+  const movieLastResyncError = String(status.movieLastResyncError || "").trim();
   const frameIndex = Number(status.frameIndex) || 0;
   const adaptiveEnabled = Boolean(status.adaptiveSyncEnabled);
   const adaptiveGain = Number(status.adaptiveGain) || 0;
@@ -2986,6 +2990,7 @@ function formatMirrorRuntimeReadout(status) {
   const lines = [
     `Mirror runtime: ${running} | mode ${mode} | fps ${fps} | movieFps ${movieEffectiveFps || "-"} | lead ${lead}ms | frame ${frameIndex}`,
     `movieSync master:${movieSyncMasterIp || "-"} id:${movieSyncId || "-"} verify:${movieSyncNegotiation || "-"}`,
+    `movieResync every:${movieResyncIntervalMs || "-"}ms count:${movieResyncCount} last:${movieLastResyncAt || "-"}${movieLastResyncError ? ` err:${movieLastResyncError}` : ""}`,
     `adaptive:${adaptiveEnabled ? "on" : "off"} gain:${adaptiveGain} max:${adaptiveMaxMs}ms burst:${burstCount}`,
     `Push ok:${Number(status.pushOk) || 0} err:${Number(status.pushErr) || 0}`,
   ];
