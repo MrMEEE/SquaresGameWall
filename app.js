@@ -2989,7 +2989,32 @@ function formatMirrorRuntimeReadout(status) {
     ? Object.values(status.workers)
     : [];
   if (!workers.length) {
-    lines.push("workers: none");
+    if (mode === "device_movie") {
+      const movieIps = new Set([
+        ...Object.keys(movieUploadMsByIp),
+        ...Object.keys(movieStartMsByIp),
+        ...Object.keys(rtModeSwitchMsByIp),
+      ]);
+      if (movieSyncMasterIp) movieIps.add(movieSyncMasterIp);
+      if (movieIps.size > 0) {
+        lines.push("movie devices:");
+        for (const ip of Array.from(movieIps).sort()) {
+          const isSyncMaster = ip === movieSyncMasterIp;
+          const uploadMs = Number(movieUploadMsByIp[ip]) || 0;
+          const startMs = Number(movieStartMsByIp[ip]) || 0;
+          const rtModeMs = Number(rtModeSwitchMsByIp[ip]) || 0;
+          const bits = [];
+          if (uploadMs > 0) bits.push(`up:${uploadMs.toFixed(0)}ms`);
+          if (startMs > 0) bits.push(`start:${startMs.toFixed(0)}ms`);
+          if (rtModeMs > 0) bits.push(`rtMode:${rtModeMs.toFixed(0)}ms`);
+          lines.push(`- ${ip}${isSyncMaster ? " [sync-master]" : ""}${bits.length ? ` ${bits.join(" ")}` : ""}`);
+        }
+      } else {
+        lines.push("movie devices: awaiting per-device telemetry");
+      }
+    } else {
+      lines.push("workers: none");
+    }
     return lines.join("\n");
   }
 
