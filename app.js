@@ -1589,12 +1589,14 @@ async function syncServerMirrorPlayback(force = false) {
   try {
     const payload = buildServerMirrorPayload(masters);
     if (!payload.frames.length) return false;
+    const isMovieMode = payload.playbackMode === "device_movie";
+    const startTimeoutMs = isMovieMode ? 45000 : 6000;
     const res = await fetchWithTimeout("/api/mirror/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       cache: "no-store",
-    }, 6000);
+    }, startTimeoutMs);
     if (!res.ok) {
       let msg = `server mirror start failed (${res.status})`;
       try {
@@ -3075,6 +3077,17 @@ function maybeAutoSyncHardwareFromVirtualMap() {
 
   syncServerMirrorPlayback(false)
     .catch((_serverErr) => {
+      const movieMode = normalizeMirrorPlaybackMode(state.serverMirrorPlaybackMode) === "device_movie";
+      if (movieMode) {
+        setPushStatus(`Auto mirror movie start failed: ${_serverErr.message}${formatMirrorStatsSuffix()}`);
+        postMirrorError("auto-mirror-movie-start-failed", {
+          error: _serverErr.message,
+          stats: state.mirrorStats,
+          animationActive: state.animation.active,
+          masters,
+        });
+        return;
+      }
       // Fallback to legacy browser-side push if server mirror endpoint is unavailable.
       return pushAllTilesToHardware({ quiet: true }).catch((err) => {
         setPushStatus(`Auto mirror failed: ${err.message}${formatMirrorStatsSuffix()}`);
