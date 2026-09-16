@@ -13,6 +13,7 @@ import json
 import base64
 import re
 import os
+import uuid
 import time
 import threading
 from datetime import datetime, timezone
@@ -246,6 +247,9 @@ class MirrorRuntime:
         self._transition_burst_count = 2
         self._transition_burst_spacing_s = 0.003
         self._last_frame_signature_by_ip = {}
+        self._playback_mode = "rt"
+        self._movie_active = False
+        self._movie_upload_backend = ""
         self._dispatch_seq = 0
 
     def status(self):
@@ -256,6 +260,9 @@ class MirrorRuntime:
                 "fps": self._fps,
                 "frames": len(self._frames),
                 "frameIndex": self._frame_index,
+                "playbackMode": self._playback_mode,
+                "movieActive": bool(self._movie_active),
+                "movieUploadBackend": self._movie_upload_backend,
                 "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
                 "masterOffsetsMs": {ip: int(round(sec * 1000.0)) for ip, sec in self._master_offsets_s.items()},
                 "adaptiveSyncEnabled": bool(self._adaptive_sync_enabled),
@@ -377,8 +384,14 @@ class MirrorRuntime:
         except Exception:
             return target
 
-    def start(self, frames, fps=20):
+    def start(self, frames, fps=20, playback_mode="rt"):
         safe_fps = max(1, min(60, int(fps or 20)))
+        playback_mode = "device_movie" if str(playback_mode or "").strip() == "device_movie" else "rt"
+
+        if playback_mode == "device_movie":
+            self._start_device_movie(frames, safe_fps)
+            return
+
         if not isinstance(frames, list) or not frames:
             raise ValueError("frames must be a non-empty list")
 
@@ -430,6 +443,9 @@ class MirrorRuntime:
             self._push_err = 0
             self._dispatch_seq = 0
             self._last_frame_signature_by_ip = {}
+            self._playback_mode = "rt"
+            self._movie_active = False
+            self._movie_upload_backend = ""
 
             current_ips = set(self._workers.keys())
             for ip in (current_ips - active_ips):
@@ -473,10 +489,25 @@ class MirrorRuntime:
             self._thread = None
             workers = list(self._workers.values())
             self._workers = {}
+            self._movie_active = False
         if thread:
             thread.join(timeout=join_timeout)
         for worker in workers:
             worker.stop(join_timeout=join_timeout)
+
+    def _set_led_mode(self, ip, token, mode):
+        body = json.dumps({"mode": str(mode)}, ensure_ascii=True).encode("utf-8")
+        status, raw, headers = self._twinkly_fetch(
+            ip,
+            "/xled/v1/led/mode",
+            method="POST",
+            body=body,
+            headers={"Content-Type": "application/json", "X-Auth-Token": token},
+            timeout=8,
+        )
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"set mode {mode} failed ({status})")
+        self._assert_api_ok(raw, headers, "/xled/v1/led/mode")
 
     def _run(self):
         while True:
@@ -616,17 +647,170 @@ class MirrorRuntime:
         return self._login(ip)
 
     def _set_rt_mode(self, ip, token):
-        body = json.dumps({"mode": "rt"}, ensure_ascii=True).encode("utf-8")
-        status, _raw, _headers = self._twinkly_fetch(
+        self._set_led_mode(ip, token, "rt")
+
+    def _push_octet(self, ip, path, token, payload):
+        status, raw, headers = self._twinkly_fetch(
             ip,
-            "/xled/v1/led/mode",
+            path,
+            method="POST",
+            body=payload,
+            headers={"Content-Type": "application/octet-stream", "X-Auth-Token": token},
+            timeout=20,
+        )
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"{path} failed ({status})")
+        self._assert_api_ok(raw, headers, path)
+
+    def _post_json(self, ip, path, token, payload):
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        status, raw, headers = self._twinkly_fetch(
+            ip,
+            path,
             method="POST",
             body=body,
             headers={"Content-Type": "application/json", "X-Auth-Token": token},
-            timeout=8,
+            timeout=12,
         )
         if status < 200 or status >= 300:
-            raise RuntimeError(f"set rt mode failed ({status})")
+            raise RuntimeError(f"{path} failed ({status})")
+        self._assert_api_ok(raw, headers, path)
+
+    def _delete_auth(self, ip, path, token):
+        status, raw, headers = self._twinkly_fetch(
+            ip,
+            path,
+            method="DELETE",
+            body=None,
+            headers={"X-Auth-Token": token},
+            timeout=12,
+        )
+        if status < 200 or status >= 300:
+            raise RuntimeError(f"{path} failed ({status})")
+        self._assert_api_ok(raw, headers, path)
+
+    def _upload_movie_v2(self, ip, token, frames_bytes, leds_per_frame, frame_count, fps):
+        try:
+            self._set_led_mode(ip, token, "rt")
+        except Exception:
+            pass
+        try:
+            self._delete_auth(ip, "/xled/v1/movies", token)
+        except Exception:
+            # Deleting old movies is best effort.
+            pass
+
+        unique_id = str(uuid.uuid4())
+        self._post_json(ip, "/xled/v1/movies/new", token, {
+            "name": "GameWall",
+            "unique_id": unique_id,
+            "descriptor_type": "rgb_raw",
+            "leds_per_frame": int(leds_per_frame),
+            "frames_number": int(frame_count),
+            "fps": int(fps),
+        })
+        self._push_octet(ip, "/xled/v1/movies/full", token, frames_bytes)
+        self._post_json(ip, "/xled/v1/led/movies/current", token, {"id": 0})
+
+    def _upload_movie_legacy(self, ip, token, frames_bytes, leds_per_frame, frame_count, fps):
+        frame_delay = max(1, int(round(1000 / max(1, int(fps)))))
+        self._post_json(ip, "/xled/v1/led/movie/config", token, {
+            "frame_delay": frame_delay,
+            "leds_number": int(leds_per_frame),
+            "frames_number": int(frame_count),
+        })
+        self._push_octet(ip, "/xled/v1/led/movie/full", token, frames_bytes)
+
+    def _upload_movie_for_ip(self, ip, frames_for_ip, fps):
+        if not frames_for_ip:
+            raise RuntimeError(f"{ip}: no frames")
+        first = frames_for_ip[0]
+        if not isinstance(first, (bytes, bytearray)) or len(first) < 3 or (len(first) % 3) != 0:
+            raise RuntimeError(f"{ip}: invalid frame payload")
+        leds_per_frame = len(first) // 3
+        for frame in frames_for_ip:
+            if len(frame) != len(first):
+                raise RuntimeError(f"{ip}: inconsistent frame sizes")
+
+        token = self._token(ip)
+        frames_bytes = b"".join(bytes(f) for f in frames_for_ip)
+        frame_count = len(frames_for_ip)
+
+        try:
+            self._upload_movie_v2(ip, token, frames_bytes, leds_per_frame, frame_count, fps)
+            return "v2"
+        except Exception as v2_exc:
+            try:
+                self._upload_movie_legacy(ip, token, frames_bytes, leds_per_frame, frame_count, fps)
+                return "legacy"
+            except Exception as legacy_exc:
+                raise RuntimeError(f"{ip}: movie upload failed (v2: {v2_exc}; legacy: {legacy_exc})")
+
+    def _start_device_movie(self, frames, fps):
+        if not isinstance(frames, list) or not frames:
+            raise ValueError("frames must be a non-empty list")
+
+        frames_by_ip = {}
+        for item in frames:
+            masters = item.get("masters") if isinstance(item, dict) else None
+            if not isinstance(masters, list) or not masters:
+                continue
+            for master in masters:
+                ip = str(master.get("ip") or "").strip()
+                data = master.get("frameBytes")
+                if not ip or not isinstance(data, (bytes, bytearray)) or len(data) < 3:
+                    continue
+                frames_by_ip.setdefault(ip, []).append(bytes(data))
+
+        if not frames_by_ip:
+            raise ValueError("no valid frames to run")
+
+        self.stop(join_timeout=1.5)
+
+        import concurrent.futures
+        backend_used = {}
+        errors = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(frames_by_ip))) as pool:
+            future_map = {
+                pool.submit(self._upload_movie_for_ip, ip, ip_frames, fps): ip
+                for ip, ip_frames in frames_by_ip.items()
+            }
+            for future, ip in future_map.items():
+                try:
+                    backend_used[ip] = future.result(timeout=45)
+                except Exception as exc:
+                    errors.append(str(exc))
+
+        if errors:
+            raise RuntimeError("; ".join(errors[:3]))
+
+        # Start playback as closely as possible across masters.
+        start_errors = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(frames_by_ip))) as pool:
+            future_map = {
+                pool.submit(self._set_led_mode, ip, self._token(ip), "movie"): ip
+                for ip in frames_by_ip.keys()
+            }
+            for future, ip in future_map.items():
+                try:
+                    future.result(timeout=8)
+                except Exception as exc:
+                    start_errors.append(f"{ip}: {exc}")
+
+        if start_errors:
+            raise RuntimeError("movie start failed: " + "; ".join(start_errors[:3]))
+
+        with self._lock:
+            self._fps = int(fps)
+            self._frames = []
+            self._frame_index = 0
+            self._workers = {}
+            self._thread = None
+            self._stop_event = threading.Event()
+            self._running = True
+            self._playback_mode = "device_movie"
+            self._movie_active = True
+            self._movie_upload_backend = ",".join(sorted(set(backend_used.values())))
 
     def _assert_api_ok(self, raw, headers, path):
         content_type = str(headers.get("Content-Type", "")).lower()
@@ -1386,6 +1570,7 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             return
 
         fps = payload.get("fps", 20)
+        playback_mode = payload.get("playbackMode", "rt")
         dispatch_lead_ms = payload.get("dispatchLeadMs", None)
         master_offsets_ms = payload.get("masterOffsetsMs", None)
         adaptive_sync_enabled = payload.get("adaptiveSyncEnabled", None)
@@ -1434,7 +1619,7 @@ class GameWallHandler(SimpleHTTPRequestHandler):
                 transition_burst_count=transition_burst_count,
                 transition_burst_spacing_ms=transition_burst_spacing_ms,
             )
-            MIRROR_RUNTIME.start(parsed_frames, fps=fps)
+            MIRROR_RUNTIME.start(parsed_frames, fps=fps, playback_mode=playback_mode)
         except Exception as exc:
             self._json_response(400, {"error": str(exc)})
             return
