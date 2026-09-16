@@ -2965,6 +2965,7 @@ function formatMirrorRuntimeReadout(status) {
   const movieEffectiveFps = Number(status.movieEffectiveFps) || 0;
   const movieSyncMasterIp = String(status.movieSyncMasterIp || "").trim();
   const movieSyncId = String(status.movieSyncId || "").trim();
+  const movieSyncNegotiation = String(status.movieSyncNegotiation || "").trim();
   const frameIndex = Number(status.frameIndex) || 0;
   const adaptiveEnabled = Boolean(status.adaptiveSyncEnabled);
   const adaptiveGain = Number(status.adaptiveGain) || 0;
@@ -2979,9 +2980,12 @@ function formatMirrorRuntimeReadout(status) {
   const rtModeSwitchMsByIp = status.rtModeSwitchMsByIp && typeof status.rtModeSwitchMsByIp === "object"
     ? status.rtModeSwitchMsByIp
     : {};
+  const movieSyncConfigByIp = status.movieSyncConfigByIp && typeof status.movieSyncConfigByIp === "object"
+    ? status.movieSyncConfigByIp
+    : {};
   const lines = [
     `Mirror runtime: ${running} | mode ${mode} | fps ${fps} | movieFps ${movieEffectiveFps || "-"} | lead ${lead}ms | frame ${frameIndex}`,
-    `movieSync master:${movieSyncMasterIp || "-"} id:${movieSyncId || "-"}`,
+    `movieSync master:${movieSyncMasterIp || "-"} id:${movieSyncId || "-"} verify:${movieSyncNegotiation || "-"}`,
     `adaptive:${adaptiveEnabled ? "on" : "off"} gain:${adaptiveGain} max:${adaptiveMaxMs}ms burst:${burstCount}`,
     `Push ok:${Number(status.pushOk) || 0} err:${Number(status.pushErr) || 0}`,
   ];
@@ -3003,10 +3007,21 @@ function formatMirrorRuntimeReadout(status) {
           const uploadMs = Number(movieUploadMsByIp[ip]) || 0;
           const startMs = Number(movieStartMsByIp[ip]) || 0;
           const rtModeMs = Number(rtModeSwitchMsByIp[ip]) || 0;
+          const syncCfg = movieSyncConfigByIp[ip] && typeof movieSyncConfigByIp[ip] === "object"
+            ? movieSyncConfigByIp[ip]
+            : {};
+          const syncMode = String(syncCfg.mode || "").trim();
+          const syncMasterId = String(syncCfg.master_id || "").trim();
+          const syncSlaveId = String(syncCfg.slave_id || "").trim();
+          const syncCompat = Number(syncCfg.compat_mode);
           const bits = [];
           if (uploadMs > 0) bits.push(`up:${uploadMs.toFixed(0)}ms`);
           if (startMs > 0) bits.push(`start:${startMs.toFixed(0)}ms`);
           if (rtModeMs > 0) bits.push(`rtMode:${rtModeMs.toFixed(0)}ms`);
+          if (syncMode) bits.push(`sync:${syncMode}`);
+          if (syncMasterId) bits.push(`mid:${syncMasterId}`);
+          if (syncSlaveId) bits.push(`sid:${syncSlaveId}`);
+          if (Number.isFinite(syncCompat)) bits.push(`compat:${syncCompat}`);
           lines.push(`- ${ip}${isSyncMaster ? " [sync-master]" : ""}${bits.length ? ` ${bits.join(" ")}` : ""}`);
         }
       } else {

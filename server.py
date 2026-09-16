@@ -257,6 +257,8 @@ class MirrorRuntime:
         self._movie_start_ms_by_ip = {}
         self._movie_sync_master_ip = ""
         self._movie_sync_id = ""
+        self._movie_sync_config_by_ip = {}
+        self._movie_sync_negotiation = ""
         self._rt_mode_switch_ms_by_ip = {}
         self._dispatch_seq = 0
 
@@ -276,6 +278,8 @@ class MirrorRuntime:
                 "movieStartMsByIp": {ip: round(float(ms), 2) for ip, ms in self._movie_start_ms_by_ip.items()},
                 "movieSyncMasterIp": self._movie_sync_master_ip,
                 "movieSyncId": self._movie_sync_id,
+                "movieSyncConfigByIp": self._movie_sync_config_by_ip,
+                "movieSyncNegotiation": self._movie_sync_negotiation,
                 "rtModeSwitchMsByIp": {ip: round(float(ms), 2) for ip, ms in self._rt_mode_switch_ms_by_ip.items()},
                 "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
                 "masterOffsetsMs": {ip: int(round(sec * 1000.0)) for ip, sec in self._master_offsets_s.items()},
@@ -468,6 +472,8 @@ class MirrorRuntime:
             self._movie_start_ms_by_ip = {}
             self._movie_sync_master_ip = ""
             self._movie_sync_id = ""
+            self._movie_sync_config_by_ip = {}
+            self._movie_sync_negotiation = ""
             # Force an explicit RT mode switch on the next push after any
             # prior mode changes (especially returning from device movie mode).
             self._rt_mode_at = {}
@@ -516,6 +522,8 @@ class MirrorRuntime:
             self._workers = {}
             self._movie_active = False
             self._movie_effective_fps = 0
+            self._movie_sync_config_by_ip = {}
+            self._movie_sync_negotiation = ""
         if thread:
             thread.join(timeout=join_timeout)
         for worker in workers:
@@ -856,7 +864,44 @@ class MirrorRuntime:
 
         self._call_with_token_retry(ip, do_set_sync)
 
-    def _sync_identity_for_ip(self, ip):
+    def _read_movie_sync_config_for_ip(self, ip):
+        def do_read(token):
+            status, raw, _headers = self._twinkly_fetch(
+                ip,
+                "/xled/v1/led/movie/config",
+                method="GET",
+                headers={"X-Auth-Token": token},
+                timeout=3,
+            )
+            if status < 200 or status >= 300:
+                raise RuntimeError(f"{ip}: movie config read failed ({status})")
+            payload = json.loads((raw or b"").decode("utf-8") or "{}")
+            sync = payload.get("sync") if isinstance(payload, dict) else {}
+            if not isinstance(sync, dict):
+                sync = {}
+            compat_raw = sync.get("compat_mode", 0)
+            try:
+                compat_mode = int(compat_raw)
+            except Exception:
+                compat_mode = 0
+            return {
+                "mode": str(sync.get("mode") or "").strip().lower(),
+                "master_id": str(sync.get("master_id") or "").strip(),
+                "slave_id": str(sync.get("slave_id") or "").strip(),
+                "compat_mode": compat_mode,
+            }
+
+        return self._call_with_token_retry(ip, do_read)
+
+    def _sync_identity_candidates_for_ip(self, ip):
+        candidates = []
+
+        def add_candidate(value):
+            value = str(value or "").strip()
+            if not value or value in candidates:
+                return
+            candidates.append(value)
+
         try:
             status, raw, _headers = self._twinkly_fetch(
                 ip,
@@ -864,16 +909,20 @@ class MirrorRuntime:
                 method="GET",
                 timeout=1.5,
             )
-            if status < 200 or status >= 300:
-                return ""
-            payload = json.loads(raw.decode("utf-8") or "{}")
-            for key in ("hw_id", "uuid", "mac"):
-                value = str(payload.get(key) or "").strip()
-                if value:
-                    return value
-            return ""
+            if status >= 200 and status < 300:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+                hw_id = str(payload.get("hw_id") or "").strip()
+                uuid_value = str(payload.get("uuid") or "").strip()
+                mac_value = str(payload.get("mac") or "").strip()
+                add_candidate(hw_id)
+                add_candidate(uuid_value)
+                add_candidate(mac_value)
+                add_candidate(mac_value.replace(":", ""))
         except Exception:
-            return ""
+            pass
+
+        add_candidate(ip)
+        return candidates
 
     def _start_device_movie(self, frames, fps):
         if not isinstance(frames, list) or not frames:
@@ -931,26 +980,76 @@ class MirrorRuntime:
         # Configure firmware-native movie sync roles.
         sync_ips = list(frames_by_ip.keys())
         sync_master_ip = sync_ips[0] if sync_ips else ""
-        shared_sync_id = self._sync_identity_for_ip(sync_master_ip) if sync_master_ip else ""
-        if not shared_sync_id:
-            shared_sync_id = sync_master_ip
+        sync_id_candidates = self._sync_identity_candidates_for_ip(sync_master_ip) if sync_master_ip else []
+        if not sync_id_candidates:
+            sync_id_candidates = [sync_master_ip]
+
+        sync_config_by_ip = {}
+        selected_sync_id = ""
+        negotiation_errors = []
+        needs_pairing = len(sync_ips) > 1
+
+        for candidate_sync_id in sync_id_candidates:
+            with self._lock:
+                self._movie_sync_master_ip = sync_master_ip
+                self._movie_sync_id = candidate_sync_id
+
+            apply_errors = []
+            verify_errors = []
+            current_configs = {}
+
+            for ip in sync_ips:
+                role = "none"
+                if needs_pairing:
+                    role = "master" if ip == sync_master_ip else "slave"
+                try:
+                    self._set_movie_sync_mode_for_ip(ip, role)
+                except Exception as exc:
+                    apply_errors.append(f"{ip}: {exc}")
+
+            if apply_errors:
+                negotiation_errors.append(f"id={candidate_sync_id} apply: " + "; ".join(apply_errors[:3]))
+                continue
+
+            for ip in sync_ips:
+                role = "none"
+                if needs_pairing:
+                    role = "master" if ip == sync_master_ip else "slave"
+                try:
+                    cfg = self._read_movie_sync_config_for_ip(ip)
+                    current_configs[ip] = cfg
+                    observed_mode = str(cfg.get("mode") or "").strip().lower()
+                    if observed_mode != role:
+                        verify_errors.append(f"{ip}: expected mode {role}, got {observed_mode or '-'}")
+                        continue
+
+                    if role == "master":
+                        observed_id = str(cfg.get("master_id") or "").strip()
+                        if observed_id != candidate_sync_id:
+                            verify_errors.append(f"{ip}: expected master_id {candidate_sync_id}, got {observed_id or '-'}")
+                    elif role == "slave":
+                        observed_id = str(cfg.get("slave_id") or "").strip()
+                        if observed_id != candidate_sync_id:
+                            verify_errors.append(f"{ip}: expected slave_id {candidate_sync_id}, got {observed_id or '-'}")
+                except Exception as exc:
+                    verify_errors.append(f"{ip}: {exc}")
+
+            if verify_errors:
+                negotiation_errors.append(f"id={candidate_sync_id} verify: " + "; ".join(verify_errors[:3]))
+                continue
+
+            selected_sync_id = candidate_sync_id
+            sync_config_by_ip = current_configs
+            break
+
+        if not selected_sync_id:
+            raise RuntimeError("movie sync pairing failed: " + "; ".join(negotiation_errors[:3]))
 
         with self._lock:
             self._movie_sync_master_ip = sync_master_ip
-            self._movie_sync_id = shared_sync_id
-
-        sync_errors = []
-        for ip in sync_ips:
-            role = "none"
-            if len(sync_ips) > 1:
-                role = "master" if ip == sync_master_ip else "slave"
-            try:
-                self._set_movie_sync_mode_for_ip(ip, role)
-            except Exception as exc:
-                sync_errors.append(f"{ip}: {exc}")
-
-        if sync_errors:
-            raise RuntimeError("movie sync role setup failed: " + "; ".join(sync_errors[:3]))
+            self._movie_sync_id = selected_sync_id
+            self._movie_sync_config_by_ip = sync_config_by_ip
+            self._movie_sync_negotiation = "verified"
 
         # Start playback as closely as possible across masters.
         # Pre-fetch tokens before the barrier so auth refresh latency does not
@@ -1012,6 +1111,7 @@ class MirrorRuntime:
             self._movie_effective_fps = int(effective_fps)
             self._movie_upload_ms_by_ip = upload_ms_by_ip
             self._movie_start_ms_by_ip = start_ms_by_ip
+            self._movie_sync_config_by_ip = dict(sync_config_by_ip)
 
     def _assert_api_ok(self, raw, headers, path):
         content_type = str(headers.get("Content-Type", "")).lower()
