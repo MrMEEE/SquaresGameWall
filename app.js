@@ -1531,7 +1531,7 @@ function buildServerMirrorPayload(masters) {
     adaptiveSyncEnabled: true,
     adaptiveGain: 0.6,
     adaptiveMaxAdvanceMs: 12,
-    transitionBurstCount: 2,
+    transitionBurstCount: calibrationMode ? 1 : 0,
     transitionBurstSpacingMs: 3,
     mode: calibrationMode ? "offset-calibration" : "render",
     frames,

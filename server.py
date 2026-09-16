@@ -786,6 +786,10 @@ class MirrorRuntime:
             except Exception as legacy_exc:
                 raise RuntimeError(f"{ip}: movie upload failed (v2: {v2_exc}; legacy: {legacy_exc})")
 
+    def _set_movie_mode_for_ip(self, ip):
+        token = self._token(ip)
+        self._set_led_mode(ip, token, "movie")
+
     def _start_device_movie(self, frames, fps):
         if not isinstance(frames, list) or not frames:
             raise ValueError("frames must be a non-empty list")
@@ -840,7 +844,7 @@ class MirrorRuntime:
         start_errors = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(frames_by_ip))) as pool:
             future_map = {
-                pool.submit(self._set_led_mode, ip, self._token(ip), "movie"): ip
+                pool.submit(self._set_movie_mode_for_ip, ip): ip
                 for ip in frames_by_ip.keys()
             }
             for future, ip in future_map.items():
