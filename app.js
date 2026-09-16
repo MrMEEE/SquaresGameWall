@@ -89,6 +89,8 @@ const state = {
   outputEnabled: true,
   mapOutputTransitionInFlight: false,
   serverSyncLeadMs: 12,
+  masterSyncOffsetsMs: {},
+  offsetCalibrationPatternEnabled: false,
   serverMirrorEnabled: true,
   serverMirrorSyncInFlight: false,
   serverMirrorLastHash: "",
@@ -268,6 +270,11 @@ const el = {
   btnMapPowerToggle: document.getElementById("btnMapPowerToggle"),
   syncLeadRange: document.getElementById("syncLeadRange"),
   syncLeadNumber: document.getElementById("syncLeadNumber"),
+  btnOffsetCalibrationPattern: document.getElementById("btnOffsetCalibrationPattern"),
+  mirrorRuntimeReadout: document.getElementById("mirrorRuntimeReadout"),
+  masterSyncOffsetNumber: document.getElementById("masterSyncOffsetNumber"),
+  btnMasterSyncOffsetMinus: document.getElementById("btnMasterSyncOffsetMinus"),
+  btnMasterSyncOffsetPlus: document.getElementById("btnMasterSyncOffsetPlus"),
   mappedBrightnessRange: document.getElementById("mappedBrightnessRange"),
   mappedBrightnessNumber: document.getElementById("mappedBrightnessNumber"),
   btnResize: document.getElementById("btnResize"),
@@ -1354,6 +1361,8 @@ function buildMasterFrameBytes(masterId, ip, totalLeds, tileRgbCache = null) {
 function getMirrorPayloadSignature(masters) {
   return JSON.stringify({
     masters: masters.map((id) => ({ id, ip: state.masterIPs[id] || "", leds: state.masterLeds[id] || 0 })),
+    masterSyncOffsetsMs: { ...state.masterSyncOffsetsMs },
+    offsetCalibrationPatternEnabled: Boolean(state.offsetCalibrationPatternEnabled),
     assignments: (state.wizard.assignments || []).map((a) => ({
       ip: a.ip,
       segment: a.segment,
@@ -1414,37 +1423,71 @@ function withAnimationFrameSnapshot(frameIndex, fn, elapsedMs = null) {
 }
 
 function buildServerMirrorPayload(masters) {
+  const calibrationMode = Boolean(state.offsetCalibrationPatternEnabled);
   const maxLeds = masters.reduce((acc, masterId) => {
     const ip = state.masterIPs[masterId];
     if (!ip) return acc;
     return Math.max(acc, estimateMasterLedCount(masterId, ip));
   }, 0);
 
-  const targetFps = maxLeds > 4096 ? 16 : (maxLeds > 2048 ? 24 : 30);
-  const animFrames = state.animation.frames.length;
-  const animActive = state.animation.active && animFrames > 0;
-  const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
-  const cycleMs = animActive ? (durationMs * animFrames) : 1000;
-  const frameCount = animActive
-    ? Math.max(animFrames, Math.min(90, Math.round((cycleMs / 1000) * targetFps)))
-    : 1;
-  const fps = animActive
-    ? Math.max(1, Math.min(60, Math.round(frameCount / (cycleMs / 1000))))
-    : 12;
+  const targetFps = calibrationMode ? 12 : (maxLeds > 4096 ? 16 : (maxLeds > 2048 ? 24 : 30));
+  const frameCount = calibrationMode ? 24 : (() => {
+    const animFrames = state.animation.frames.length;
+    const animActive = state.animation.active && animFrames > 0;
+    const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
+    const cycleMs = animActive ? (durationMs * animFrames) : 1000;
+    if (animActive) {
+      return Math.max(animFrames, Math.min(90, Math.round((cycleMs / 1000) * targetFps)));
+    }
+    return 1;
+  })();
+  const fps = calibrationMode ? 12 : (() => {
+    const animFrames = state.animation.frames.length;
+    const animActive = state.animation.active && animFrames > 0;
+    const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
+    const cycleMs = animActive ? (durationMs * animFrames) : 1000;
+    if (animActive) {
+      return Math.max(1, Math.min(60, Math.round(frameCount / (cycleMs / 1000))));
+    }
+    return 12;
+  })();
+
+  const neededTileIds = new Set();
+  for (const masterId of masters) {
+    for (const tileId of getOrderedTilesForMaster(masterId)) {
+      if (Number.isInteger(tileId)) neededTileIds.add(tileId);
+    }
+  }
+
+  const colorA = [14, 200, 255];
+  const colorB = [255, 72, 24];
+  const calibrationTileCacheByFrame = new Map();
+  const getCalibrationTileRgb = (tileId, frameIndex) => {
+    const cacheKey = `${tileId}:${frameIndex}`;
+    if (calibrationTileCacheByFrame.has(cacheKey)) return calibrationTileCacheByFrame.get(cacheKey);
+    const useA = (frameIndex % 24) < 12;
+    const color = useA ? colorA : colorB;
+    const pixels = [];
+    for (let i = 0; i < LEDS_PER_TILE; i += 1) {
+      pixels.push([color[0], color[1], color[2]]);
+    }
+    calibrationTileCacheByFrame.set(cacheKey, pixels);
+    return pixels;
+  };
 
   const frames = [];
   for (let frameIndex = 0; frameIndex < frameCount; frameIndex += 1) {
-    const elapsedMs = animActive ? ((frameIndex / frameCount) * cycleMs) : null;
+    const elapsedMs = calibrationMode ? null : (() => {
+      const animFrames = state.animation.frames.length;
+      const animActive = state.animation.active && animFrames > 0;
+      const durationMs = Math.max(40, Number(state.animation.frameDurationMs) || 120);
+      const cycleMs = animActive ? (durationMs * animFrames) : 1000;
+      return animActive ? ((frameIndex / frameCount) * cycleMs) : null;
+    })();
     const packed = withAnimationFrameSnapshot(frameIndex, () => {
       const tileRgbCache = new Map();
-      const neededTileIds = new Set();
-      for (const masterId of masters) {
-        for (const tileId of getOrderedTilesForMaster(masterId)) {
-          if (Number.isInteger(tileId)) neededTileIds.add(tileId);
-        }
-      }
       for (const tileId of neededTileIds) {
-        tileRgbCache.set(tileId, getTilePixelRgb(tileId));
+        tileRgbCache.set(tileId, calibrationMode ? getCalibrationTileRgb(tileId, frameIndex) : getTilePixelRgb(tileId));
       }
 
       const mastersPayload = [];
@@ -1468,6 +1511,8 @@ function buildServerMirrorPayload(masters) {
   return {
     fps,
     dispatchLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
+    masterOffsetsMs: buildMasterOffsetsByIp(),
+    mode: calibrationMode ? "offset-calibration" : "render",
     frames,
   };
 }
@@ -1612,7 +1657,10 @@ async function applyServerMirrorTuning() {
     await fetchWithTimeout("/api/mirror/tuning", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ dispatchLeadMs: state.serverSyncLeadMs }),
+      body: JSON.stringify({
+        dispatchLeadMs: state.serverSyncLeadMs,
+        masterOffsetsMs: buildMasterOffsetsByIp(),
+      }),
       cache: "no-store",
     }, 3500);
   } catch (_e) {
@@ -2672,11 +2720,166 @@ async function fetchDuckDuckGoSearchBatch(query, startOffset, pageCount = 3) {
 let autoHardwarePushLastMs = 0;
 let autoHardwarePushInFlight = false;
 let passiveHardwareMirrorTimerId = null;
+let mirrorStatusPollTimerId = null;
+let mirrorStatusPollInFlight = false;
 let autoMirrorInfoLastText = "";
 let autoMirrorInfoLastAtMs = 0;
 let mirrorDebugLastInfoAtMs = 0;
 let mirrorDebugLastErrorAtMs = 0;
 let mirrorDebugLastErrorText = "";
+
+function setMirrorRuntimeReadout(text) {
+  if (!el.mirrorRuntimeReadout) return;
+  el.mirrorRuntimeReadout.textContent = text;
+}
+
+function updateOffsetCalibrationPatternButton() {
+  if (!el.btnOffsetCalibrationPattern) return;
+  if (state.offsetCalibrationPatternEnabled) {
+    el.btnOffsetCalibrationPattern.textContent = "Offset Pattern: ON";
+    el.btnOffsetCalibrationPattern.classList.add("danger");
+    el.btnOffsetCalibrationPattern.classList.remove("secondary");
+  } else {
+    el.btnOffsetCalibrationPattern.textContent = "Offset Pattern: OFF";
+    el.btnOffsetCalibrationPattern.classList.remove("danger");
+    el.btnOffsetCalibrationPattern.classList.add("secondary");
+  }
+}
+
+function clampMasterSyncOffsetMs(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(-40, Math.min(40, Math.round(n)));
+}
+
+function getMasterSyncOffsetMs(masterTileId) {
+  return clampMasterSyncOffsetMs(state.masterSyncOffsetsMs?.[masterTileId], 0);
+}
+
+function syncSelectedMasterOffsetControl() {
+  if (!el.masterSyncOffsetNumber) return;
+  const tile = getTileById(state.selectedTileId);
+  if (!tile || !tile.isMaster) {
+    el.masterSyncOffsetNumber.value = "0";
+    return;
+  }
+  el.masterSyncOffsetNumber.value = String(getMasterSyncOffsetMs(tile.id));
+}
+
+function buildMasterOffsetsByIp() {
+  const out = {};
+  for (const [idText, ipRaw] of Object.entries(state.masterIPs || {})) {
+    const masterTileId = Number(idText);
+    const ip = String(ipRaw || "").trim();
+    if (!Number.isInteger(masterTileId) || !ip) continue;
+    const offset = getMasterSyncOffsetMs(masterTileId);
+    if (offset !== 0) out[ip] = offset;
+  }
+  return out;
+}
+
+function setSelectedMasterOffsetMs(value) {
+  const tile = getTileById(state.selectedTileId);
+  if (!tile || !tile.isMaster) {
+    syncSelectedMasterOffsetControl();
+    return;
+  }
+  const next = clampMasterSyncOffsetMs(value, getMasterSyncOffsetMs(tile.id));
+  if (next === 0) {
+    delete state.masterSyncOffsetsMs[tile.id];
+  } else {
+    state.masterSyncOffsetsMs[tile.id] = next;
+  }
+  syncSelectedMasterOffsetControl();
+  renderTileDetails();
+  saveMapAutosave();
+  applyServerMirrorTuning();
+  setStatus(`Master ${tile.id} sync offset set to ${next}ms.`);
+}
+
+function nudgeSelectedMasterOffsetMs(deltaMs) {
+  const tile = getTileById(state.selectedTileId);
+  if (!tile || !tile.isMaster) {
+    syncSelectedMasterOffsetControl();
+    return;
+  }
+  const current = getMasterSyncOffsetMs(tile.id);
+  setSelectedMasterOffsetMs(current + Number(deltaMs || 0));
+}
+
+function setOffsetCalibrationPatternEnabled(enabled) {
+  const next = Boolean(enabled);
+  if (next === state.offsetCalibrationPatternEnabled) {
+    updateOffsetCalibrationPatternButton();
+    return;
+  }
+  state.offsetCalibrationPatternEnabled = next;
+  updateOffsetCalibrationPatternButton();
+  state.serverMirrorLastHash = "";
+  saveMapAutosave();
+  maybeAutoSyncHardwareFromVirtualMap();
+  setStatus(next
+    ? "Offset calibration pattern enabled (1s color alternation)."
+    : "Offset calibration pattern disabled.");
+}
+
+function formatMirrorRuntimeReadout(status) {
+  if (!status || typeof status !== "object") {
+    return "Mirror runtime: unavailable";
+  }
+  const running = status.running ? "running" : "idle";
+  const fps = Number(status.fps) || 0;
+  const lead = Number(status.dispatchLeadMs) || 0;
+  const frameIndex = Number(status.frameIndex) || 0;
+  const lines = [
+    `Mirror runtime: ${running} | fps ${fps} | lead ${lead}ms | frame ${frameIndex}`,
+    `Push ok:${Number(status.pushOk) || 0} err:${Number(status.pushErr) || 0}`,
+  ];
+  const workers = status.workers && typeof status.workers === "object"
+    ? Object.values(status.workers)
+    : [];
+  if (!workers.length) {
+    lines.push("workers: none");
+    return lines.join("\n");
+  }
+
+  let newestPushMs = 0;
+  for (const w of workers) {
+    const ms = Date.parse(String(w?.lastPushAt || ""));
+    if (Number.isFinite(ms)) newestPushMs = Math.max(newestPushMs, ms);
+  }
+
+  lines.push("workers:");
+  for (const w of workers) {
+    const ip = String(w?.ip || "?");
+    const pushOk = Number(w?.pushOk) || 0;
+    const pushErr = Number(w?.pushErr) || 0;
+    const wf = Number(w?.targetFps) || 0;
+    const offsetMs = Number(w?.configuredOffsetMs) || 0;
+    const pushMs = Date.parse(String(w?.lastPushAt || ""));
+    const lagMs = newestPushMs && Number.isFinite(pushMs) ? Math.max(0, newestPushMs - pushMs) : 0;
+    lines.push(`- ${ip} fps:${wf} off:${offsetMs}ms ok:${pushOk} err:${pushErr} lag:${Math.round(lagMs)}ms`);
+  }
+  return lines.join("\n");
+}
+
+async function pollMirrorRuntimeStatus() {
+  if (mirrorStatusPollInFlight) return;
+  mirrorStatusPollInFlight = true;
+  try {
+    const res = await fetchWithTimeout("/api/mirror/status", { cache: "no-store" }, 2000);
+    if (!res.ok) {
+      setMirrorRuntimeReadout(`Mirror runtime: status request failed (${res.status})`);
+      return;
+    }
+    const status = await res.json();
+    setMirrorRuntimeReadout(formatMirrorRuntimeReadout(status));
+  } catch (err) {
+    setMirrorRuntimeReadout(`Mirror runtime: status unavailable (${err.message})`);
+  } finally {
+    mirrorStatusPollInFlight = false;
+  }
+}
 
 function setAutoMirrorInfo(text) {
   const now = Date.now();
@@ -2771,6 +2974,13 @@ function ensurePassiveHardwareMirror() {
     if (state.wizard.active || state.livePushActive) return;
     maybeAutoSyncHardwareFromVirtualMap();
   }, 100);
+
+  if (mirrorStatusPollTimerId == null) {
+    mirrorStatusPollTimerId = setInterval(() => {
+      pollMirrorRuntimeStatus();
+    }, 1200);
+    pollMirrorRuntimeStatus();
+  }
 }
 
 function inferSegmentsFromLedCount(_ip, ledCountRaw) {
@@ -4557,6 +4767,7 @@ function renderTileDetails() {
   if (state.selectedTileId == null) {
     el.tileDetails.textContent = "No tile selected.";
     el.masterIpRow.hidden = true;
+    syncSelectedMasterOffsetControl();
     updateGeneralButtonStates();
     return;
   }
@@ -4565,6 +4776,7 @@ function renderTileDetails() {
   if (!tile) {
     el.tileDetails.textContent = "No tile selected.";
     el.masterIpRow.hidden = true;
+    syncSelectedMasterOffsetControl();
     updateGeneralButtonStates();
     return;
   }
@@ -4590,11 +4802,14 @@ function renderTileDetails() {
   if (tile.isMaster) {
     const ip = state.masterIPs[tile.id] || "";
     details.push(`ip: ${ip || "not set"}`);
+    details.push(`sync offset: ${getMasterSyncOffsetMs(tile.id)}ms`);
     el.masterIpRow.hidden = false;
     el.masterIpInput.value = ip;
     el.masterIpInput.placeholder = "192.168.1.x";
+    syncSelectedMasterOffsetControl();
   } else {
     el.masterIpRow.hidden = true;
+    syncSelectedMasterOffsetControl();
   }
 
   const rot = state.tileRotations[tile.id] || 0;
@@ -4681,6 +4896,11 @@ function buildExportPayload(includeGeneratedAt = true) {
       mappedPercent: clampBrightnessPercent(state.mappedBrightness, 100),
       tileOffsets: { ...state.tileBrightnessOffsets },
     },
+    mirror: {
+      syncLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
+      masterOffsetsMs: { ...state.masterSyncOffsetsMs },
+      offsetCalibrationPatternEnabled: Boolean(state.offsetCalibrationPatternEnabled),
+    },
     masters,
     tiles,
   };
@@ -4753,6 +4973,9 @@ async function importData(data) {
   state.twinklyRtFrameFormat = {};
   state.tileRotations = {};
   state.tileBrightnessOffsets = {};
+  state.masterSyncOffsetsMs = {};
+  state.offsetCalibrationPatternEnabled = Boolean(data?.mirror?.offsetCalibrationPatternEnabled);
+  state.serverSyncLeadMs = clampSyncLeadMs(data?.mirror?.syncLeadMs, 12);
   state.mappedBrightness = clampBrightnessPercent(data?.brightness?.mappedPercent, 100);
   state.wizard.lockedTiles = {};
   state.wizard.assignments = [];
@@ -4769,6 +4992,16 @@ async function importData(data) {
     }
   }
   syncMappedBrightnessControls();
+  syncSyncLeadControls();
+  if (data?.mirror?.masterOffsetsMs && typeof data.mirror.masterOffsetsMs === "object") {
+    for (const [k, v] of Object.entries(data.mirror.masterOffsetsMs)) {
+      const tileId = Number(k);
+      if (!Number.isInteger(tileId)) continue;
+      const clamped = clampMasterSyncOffsetMs(v, 0);
+      if (clamped !== 0) state.masterSyncOffsetsMs[tileId] = clamped;
+    }
+  }
+  updateOffsetCalibrationPatternButton();
 
   const masterIpById = new Map();
   for (const m of data.masters) {
@@ -6919,6 +7152,12 @@ function bindEvents() {
     });
   }
 
+  if (el.btnOffsetCalibrationPattern) {
+    el.btnOffsetCalibrationPattern.addEventListener("click", () => {
+      setOffsetCalibrationPatternEnabled(!state.offsetCalibrationPatternEnabled);
+    });
+  }
+
   el.masterIpInput.addEventListener("change", () => {
     const tile = getTileById(state.selectedTileId);
     if (!tile || !tile.isMaster) return;
@@ -6934,6 +7173,32 @@ function bindEvents() {
     saveMapAutosave();
     updateGeneralButtonStates();
   });
+
+  if (el.masterSyncOffsetNumber) {
+    el.masterSyncOffsetNumber.addEventListener("input", () => {
+      setSelectedMasterOffsetMs(el.masterSyncOffsetNumber.value);
+    });
+    el.masterSyncOffsetNumber.addEventListener("change", () => {
+      setSelectedMasterOffsetMs(el.masterSyncOffsetNumber.value);
+    });
+    el.masterSyncOffsetNumber.addEventListener("keydown", (event) => {
+      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+      event.preventDefault();
+      const delta = event.key === "ArrowUp" ? 1 : -1;
+      const step = event.shiftKey ? 5 : 1;
+      nudgeSelectedMasterOffsetMs(delta * step);
+    });
+  }
+  if (el.btnMasterSyncOffsetMinus) {
+    el.btnMasterSyncOffsetMinus.addEventListener("click", () => {
+      nudgeSelectedMasterOffsetMs(-1);
+    });
+  }
+  if (el.btnMasterSyncOffsetPlus) {
+    el.btnMasterSyncOffsetPlus.addEventListener("click", () => {
+      nudgeSelectedMasterOffsetMs(1);
+    });
+  }
 
   if (el.btnWizardDiscover) {
     el.btnWizardDiscover.addEventListener("click", async () => {
@@ -7688,6 +7953,8 @@ function buildMapSnapshot() {
     },
     mirror: {
       syncLeadMs: clampSyncLeadMs(state.serverSyncLeadMs, 12),
+      masterOffsetsMs: { ...state.masterSyncOffsetsMs },
+      offsetCalibrationPatternEnabled: Boolean(state.offsetCalibrationPatternEnabled),
     },
     masters: state.tiles
       .filter((t) => t.isMaster)
@@ -7851,6 +8118,8 @@ function applyMapSnapshot(d) {
   state.masterLeds = {};
   state.tileRotations = {};
   state.tileBrightnessOffsets = {};
+  state.masterSyncOffsetsMs = {};
+  state.offsetCalibrationPatternEnabled = Boolean(d?.mirror?.offsetCalibrationPatternEnabled);
   state.mappedBrightness = clampBrightnessPercent(d?.brightness?.mappedPercent, 100);
   state.serverSyncLeadMs = clampSyncLeadMs(d?.mirror?.syncLeadMs, 12);
   if (d?.brightness?.tileOffsets && typeof d.brightness.tileOffsets === "object") {
@@ -7865,6 +8134,15 @@ function applyMapSnapshot(d) {
   }
   syncMappedBrightnessControls();
   syncSyncLeadControls();
+  if (d?.mirror?.masterOffsetsMs && typeof d.mirror.masterOffsetsMs === "object") {
+    for (const [k, v] of Object.entries(d.mirror.masterOffsetsMs)) {
+      const tileId = Number(k);
+      if (!Number.isInteger(tileId)) continue;
+      const clamped = clampMasterSyncOffsetMs(v, 0);
+      if (clamped !== 0) state.masterSyncOffsetsMs[tileId] = clamped;
+    }
+  }
+  updateOffsetCalibrationPatternButton();
   state.wizard.selectedIp = String(d.wizard?.selectedIp || "");
   state.wizard.scanSubnet = normalizeScanSubnetScope(d.wizard?.scanSubnet || "") || "";
   if (el.wizardScanSubnet) el.wizardScanSubnet.value = state.wizard.scanSubnet;
@@ -8185,6 +8463,7 @@ async function init() {
   switchView("map");
   syncMappedBrightnessControls();
   syncSyncLeadControls();
+  updateOffsetCalibrationPatternButton();
   updateMapPowerButtonState();
   renderActionSelect();
   renderActionTimeline();

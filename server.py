@@ -41,6 +41,9 @@ class MirrorRuntime:
             self._target_fps = 20.0
             self._min_interval_s = 1.0 / 20.0
             self._next_allowed_at = 0.0
+            self._configured_offset_s = 0.0
+            self._last_frame_seq = 0
+            self._last_dispatch_skew_ms = 0.0
             self.push_ok = 0
             self.push_err = 0
             self.last_push_at = ""
@@ -82,11 +85,23 @@ class MirrorRuntime:
                 self._target_fps = value
                 self._min_interval_s = 1.0 / value
 
+        def set_offset_ms(self, offset_ms):
+            try:
+                value = float(offset_ms)
+            except Exception:
+                value = 0.0
+            value = max(-40.0, min(40.0, value))
+            with self._lock:
+                self._configured_offset_s = value / 1000.0
+
         def snapshot(self):
             with self._lock:
                 return {
                     "ip": self.ip,
                     "targetFps": round(self._target_fps, 2),
+                    "configuredOffsetMs": int(round(self._configured_offset_s * 1000.0)),
+                    "lastFrameSeq": int(self._last_frame_seq),
+                    "lastDispatchSkewMs": round(float(self._last_dispatch_skew_ms), 2),
                     "pushOk": self.push_ok,
                     "pushErr": self.push_err,
                     "lastPushAt": self.last_push_at,
@@ -155,6 +170,13 @@ class MirrorRuntime:
                         pending = latest
 
                 try:
+                    target_at = pending.get("targetAt")
+                    skew_ms = 0.0
+                    if isinstance(target_at, (int, float)):
+                        skew_ms = (time.perf_counter() - float(target_at)) * 1000.0
+                    with self._lock:
+                        self._last_frame_seq = int(pending.get("frameSeq") or 0)
+                        self._last_dispatch_skew_ms = skew_ms
                     self.runtime._push_rt_frame(self.ip, pending["frameBytes"])
                     with self._lock:
                         self._next_allowed_at = time.perf_counter() + self._min_interval_s
@@ -179,6 +201,7 @@ class MirrorRuntime:
         self._push_ok = 0
         self._push_err = 0
         self._dispatch_lead_s = 0.012
+        self._master_offsets_s = {}
         self._dispatch_seq = 0
 
     def status(self):
@@ -190,6 +213,7 @@ class MirrorRuntime:
                 "frames": len(self._frames),
                 "frameIndex": self._frame_index,
                 "dispatchLeadMs": int(round(self._dispatch_lead_s * 1000.0)),
+                "masterOffsetsMs": {ip: int(round(sec * 1000.0)) for ip, sec in self._master_offsets_s.items()},
                 "workers": worker_snaps,
                 "lastPushAt": self._last_push_at,
                 "lastError": self._last_error,
@@ -197,13 +221,37 @@ class MirrorRuntime:
                 "pushErr": self._push_err,
             }
 
-    def set_tuning(self, dispatch_lead_ms=None):
+    def set_tuning(self, dispatch_lead_ms=None, master_offsets_ms=None):
         if dispatch_lead_ms is None:
-            return
-        lead = int(dispatch_lead_ms)
-        lead = max(0, min(30, lead))
+            lead = None
+        else:
+            lead = int(dispatch_lead_ms)
+            lead = max(0, min(30, lead))
+
+        parsed_offsets = None
+        if isinstance(master_offsets_ms, dict):
+            parsed_offsets = {}
+            for ip_raw, value in master_offsets_ms.items():
+                ip = str(ip_raw or "").strip()
+                if not ip:
+                    continue
+                try:
+                    offset = float(value)
+                except Exception:
+                    offset = 0.0
+                offset = max(-40.0, min(40.0, offset))
+                parsed_offsets[ip] = offset / 1000.0
+
         with self._lock:
-            self._dispatch_lead_s = lead / 1000.0
+            if lead is not None:
+                self._dispatch_lead_s = lead / 1000.0
+            if parsed_offsets is not None:
+                self._master_offsets_s = parsed_offsets
+            current_offsets = dict(self._master_offsets_s)
+            workers = list(self._workers.items())
+
+        for ip, worker in workers:
+            worker.set_offset_ms((current_offsets.get(ip, 0.0)) * 1000.0)
 
     def _probe_target_fps(self, ip, fallback_fps):
         target = float(max(1, min(60, int(fallback_fps or 20))))
@@ -290,6 +338,7 @@ class MirrorRuntime:
             for ip in (active_ips - current_ips):
                 worker = MirrorRuntime._MasterWorker(self, ip)
                 worker.set_target_fps(worker_fps.get(ip, safe_fps))
+                worker.set_offset_ms(float(self._master_offsets_s.get(ip, 0.0)) * 1000.0)
                 self._workers[ip] = worker
                 worker.start()
 
@@ -297,6 +346,7 @@ class MirrorRuntime:
                 worker = self._workers.get(ip)
                 if worker:
                     worker.set_target_fps(worker_fps.get(ip, safe_fps))
+                    worker.set_offset_ms(float(self._master_offsets_s.get(ip, 0.0)) * 1000.0)
 
             self._stop_event = threading.Event()
             self._running = True
@@ -346,7 +396,8 @@ class MirrorRuntime:
                     continue
                 worker = workers.get(ip)
                 if worker:
-                    worker.submit(frame_bytes, target_at=target_at, frame_seq=frame_seq)
+                    offset_s = float(self._master_offsets_s.get(ip, 0.0))
+                    worker.submit(frame_bytes, target_at=(target_at + offset_s), frame_seq=frame_seq)
 
             interval = 1.0 / max(1, fps)
             elapsed = time.perf_counter() - started
@@ -1183,6 +1234,7 @@ class GameWallHandler(SimpleHTTPRequestHandler):
 
         fps = payload.get("fps", 20)
         dispatch_lead_ms = payload.get("dispatchLeadMs", None)
+        master_offsets_ms = payload.get("masterOffsetsMs", None)
         frames = payload.get("frames") if isinstance(payload, dict) else None
         if not isinstance(frames, list) or not frames:
             self._json_response(400, {"error": "frames[] is required"})
@@ -1215,7 +1267,7 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            MIRROR_RUNTIME.set_tuning(dispatch_lead_ms=dispatch_lead_ms)
+            MIRROR_RUNTIME.set_tuning(dispatch_lead_ms=dispatch_lead_ms, master_offsets_ms=master_offsets_ms)
             MIRROR_RUNTIME.start(parsed_frames, fps=fps)
         except Exception as exc:
             self._json_response(400, {"error": str(exc)})
@@ -1231,8 +1283,9 @@ class GameWallHandler(SimpleHTTPRequestHandler):
             return
 
         dispatch_lead_ms = payload.get("dispatchLeadMs", None) if isinstance(payload, dict) else None
+        master_offsets_ms = payload.get("masterOffsetsMs", None) if isinstance(payload, dict) else None
         try:
-            MIRROR_RUNTIME.set_tuning(dispatch_lead_ms=dispatch_lead_ms)
+            MIRROR_RUNTIME.set_tuning(dispatch_lead_ms=dispatch_lead_ms, master_offsets_ms=master_offsets_ms)
         except Exception as exc:
             self._json_response(400, {"error": str(exc)})
             return

@@ -39,7 +39,10 @@
           <input id="syncLeadRange" type="range" min="0" max="30" step="1" value="12" />
         </label>
         <input id="syncLeadNumber" type="number" min="0" max="30" step="1" value="12" />
+        <button id="btnOffsetCalibrationPattern" class="secondary" type="button">Offset Pattern: OFF</button>
       </div>
+
+      <div id="mirrorRuntimeReadout" class="mirror-runtime-readout" aria-live="polite">Mirror runtime: idle</div>
 
       <div class="map-brightness-row">
         <label>Mapped Tile Brightness (%)
@@ -79,6 +82,12 @@
         <label>Master IP Address
           <input id="masterIpInput" type="text" placeholder="192.168.1.x" spellcheck="false" />
         </label>
+        <label>Master Sync Offset (ms)</label>
+        <div class="master-offset-controls">
+          <button id="btnMasterSyncOffsetMinus" class="secondary" type="button">-1ms</button>
+          <input id="masterSyncOffsetNumber" type="number" min="-40" max="40" step="1" value="0" />
+          <button id="btnMasterSyncOffsetPlus" class="secondary" type="button">+1ms</button>
+        </div>
       </div>
 
       <h3>Hardware Wizard</h3>

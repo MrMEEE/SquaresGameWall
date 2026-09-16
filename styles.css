@@ -129,7 +129,7 @@ h1 {
 
 .map-sync-row {
   display: grid;
-  grid-template-columns: 1fr 112px;
+  grid-template-columns: 1fr 112px auto;
   gap: 10px;
   align-items: end;
   margin-bottom: 10px;
@@ -137,6 +137,22 @@ h1 {
 
 .map-sync-row input[type="number"] {
   width: 100%;
+}
+
+.map-sync-row button {
+  white-space: nowrap;
+}
+
+.mirror-runtime-readout {
+  margin: 2px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  padding: 8px 10px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: pre-wrap;
 }
 
 .map-brightness-row input[type="number"] {
@@ -328,6 +344,21 @@ button:disabled {
 
 .master-ip-row {
   margin-top: 8px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.master-ip-row input[type="number"] {
+  width: 100%;
+}
+
+.master-offset-controls {
+  display: grid;
+  grid-template-columns: auto 86px auto;
+  gap: 6px;
+  align-items: center;
 }
 
 .discovery-panel {
@@ -864,6 +895,11 @@ button:disabled {
 @media (max-width: 1200px) {
   .characters-grid {
     grid-template-columns: 1fr;
+  }
+
+  .map-sync-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
   }
 
   .sprite-editor-controls {
